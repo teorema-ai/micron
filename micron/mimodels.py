@@ -148,19 +148,31 @@ class GPT2:
             ):
         if topic == 'model':
             model = self._model(tokenizer, context_len)
-            #model.load_pretrained()
+            model.from_pretrained(root)
             return model
         elif topic == 'stats':
-            with open(os.path.join(model_root, "train_loss_dicts.pickle"), 'rb') as train_loss_file:
+            with open(os.path.join(root, "train_loss_dicts.pickle"), 'rb') as train_loss_file:
                 train_loss_dicts = pickle.load(train_loss_file)
-            with open(os.path.join(model_root, "eval_loss_dicts.pickle"), 'rb') as eval_loss_file:
-                eval_loss_dicts = pickle.dump(eval_loss_file)
+            with open(os.path.join(root, "eval_loss_dicts.pickle"), 'rb') as eval_loss_file:
+                eval_loss_dicts = pickle.load(eval_loss_file)
             return train_loss_dicts, eval_loss_dicts
         else:
             raise ValueError()
 
+    def valid(self, root, topic, **scope):
+        if topic not in ['model', 'stats']:
+             raise ValueError(f"Unknown topic: {topics}")
+        if topic == 'stats':
+             _ = (os.path.isfile(os.path.join(root, "train_loss_dicts.pickle"))) and \
+                 (os.path.isfile(os.path.join(root, "eval_loss_dicts.pickle")))
+        else:
+            _ = (os.path.isfile(os.path.join(root, "pytorch_model.bin"))) and \
+                (os.path.isfile(os.path.join(root, "config.json"))) and\
+                (os.path.isfile(os.path.join(root, "generation_config.json")))
+        return _
+
     @staticmethod
-    def plot_losses(train_loss_dicts, eval_loss_dicts, *, show=True):
+    def plot_losses(train_loss_dicts, eval_loss_dicts, *, show=False):
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=[d['epoch'] for d in train_loss_dicts], y=[d['train_loss'] for d in train_loss_dicts], name='train_loss'))
         fig.add_trace(go.Scatter(x=[d['epoch'] for d in eval_loss_dicts], y=[d['eval_loss'] for d in eval_loss_dicts], name='eval_loss'))

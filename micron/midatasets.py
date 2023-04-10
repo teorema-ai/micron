@@ -18,8 +18,6 @@ from datasets import Dataset, DatasetDict, load_dataset, splits
 import tokenizers
 import transformers
 
-from datablocks.datablock import Datablock
-
 
 class DatasetsMixin:
     """
@@ -264,8 +262,6 @@ class GRCh38(DatasetsMixin):
                 del _ray_client
         return subseqs
 
-#GRCh38Datablock = Datablock.define(GRCh38, module_name=__name__, topics=["rna_seqs"], version=GRCh38_VERSION)
-
 
 MIRNA_VERSION = "0.0.1"
 MIRNA_DATASET_URL = "https://mirbase.org/ftp/CURRENT"
@@ -360,8 +356,6 @@ class MiRNA(DatasetsMixin):
         rec['sequence'] = ''.join([c for c in sq.upper() if c in ['A', 'C', 'G', 'U']])
         return rec
 
-#MiRNADatablock = Datablock.define(MiRNA, module_name=__name__, topics=["rna_seqs"], version=MIRNA_VERSION, use_local_storage=True)
-
 
 TOKENIZER_VERSION = '0.0.1'
 TOKENIZER_TRAINER_CHUNK_SIZE = 200
@@ -438,9 +432,6 @@ class Tokenizer:
         )
         tokenizer.pad_token = tokenizer.eos_token
         return tokenizer
-
-
-#TokenizerDatablock = Datablock.define(Tokenizer, topics=["tokenizer"], version=TOKENIZER_VERSION, use_local_storage=True)
 
 
 TOKENIZED_DATASET_VERSION = '0.0.1'
