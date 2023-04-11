@@ -162,7 +162,7 @@ class GRCh38(DatasetsMixin):
              storage_options={},
              **unused_api_kwargs, 
              ):
-        train_path, test_path = cls._dataset_paths(root)
+        train_path, test_path = self._dataset_paths(root)
         train_dataframe = pd.read_parquet(train_path, storage_options=storage_options, engine="pyarrow") 
         train_dataset = Dataset.from_pandas(train_dataframe, split='train')
         test_dataframe = pd.read_parquet(test_path, storage_options=storage_options, engine="pyarrow")
