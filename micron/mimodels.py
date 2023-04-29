@@ -25,7 +25,7 @@ def torch_setup():
      return "WANDB_DISABLED" in os.environ and "CUDA_VISIBLE_DEVICES" in os.environ
 
 
-GPT2_VERSION = "0.0.1"
+GPT2_VERSION = "0.1.1"
 GPT2_CONTEXT_LEN = micron.midatasets.TOKENIZER_MAX_LEN
 GPT2_NUM_EPOCHS = 3
 GPT2_LEARNING_RATE = 2e-5
@@ -47,13 +47,16 @@ class GPT2:
         
     def build(self,
             roots,
-            storage_options,
             *,
             tokenized_datasets,
             tokenizer,
             train_max_samples=None,
             test_max_samples=None,
-            context_len=GPT2_CONTEXT_LEN,
+            n_ctx=30,
+            n_embd=768,
+            n_head=12,
+            n_layer=12,
+            n_positions=1024,
             num_epochs=GPT2_NUM_EPOCHS,
             learning_rate=GPT2_LEARNING_RATE,
             weight_decay=GPT2_WEIGHT_DECAY,
@@ -67,7 +70,12 @@ class GPT2:
         model_root = roots['model']
         stats_root = roots['stats']
 
-        model = self._model(tokenizer, context_len)
+        model = self.model(tokenizer=tokenizer, 
+                           n_ctx=n_ctx,
+                           n_embd=n_embd,
+                           n_head=n_head,
+                           n_layer=n_layer,
+                           n_positions=n_positions,)
 
         data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
         training_args = TrainingArguments(
@@ -102,6 +110,10 @@ class GPT2:
             _tokenized_datasets_test = tokenized_datasets['test'].select(range(test_max_samples))
         else:
             _tokenized_datasets_test = tokenized_datasets['test']
+
+        if self.verbose:
+             print(f"Training model using train dataset of size {len(_tokenized_datasets_train)}")
+             print(f"Training model using test dataset of size {len(_tokenized_datasets_test)}")
         
         trainer = Trainer(
             model=model,
@@ -131,14 +143,17 @@ class GPT2:
 
     def read(self, 
              root, 
-             storage_options,
              topic,
              *, 
              tokenized_datasets,
              tokenizer,
              train_max_samples=None,
              test_max_samples=None,
-             context_len=GPT2_CONTEXT_LEN,
+             n_ctx=30,
+             n_embd=768,
+             n_head=12,
+             n_layer=12,
+             n_positions=1024,
              num_epochs=GPT2_NUM_EPOCHS,
              learning_rate=GPT2_LEARNING_RATE,
              weight_decay=GPT2_WEIGHT_DECAY,
@@ -147,7 +162,12 @@ class GPT2:
              new_model_init_weights=False,
             ):
         if topic == 'model':
-            model = self._model(tokenizer, context_len)
+            model = self.model(tokenizer=tokenizer, 
+                            n_ctx=n_ctx,
+                            n_embd=n_embd,
+                            n_head=n_head,
+                            n_layer=n_layer,
+                            n_positions=n_positions,)
             model.from_pretrained(root)
             return model
         elif topic == 'stats':
@@ -184,11 +204,22 @@ class GPT2:
             print(f"eval_loss: min: {min(eval_loss)}, max: {max(eval_loss)}")
         return fig
 
-    def _model(self, tokenizer, context_len):
+    def model(self,
+               *, 
+               tokenizer,
+               n_ctx,
+               n_embd,
+               n_head,
+               n_layer,
+               n_positions,):
         config = AutoConfig.from_pretrained(
             "gpt2",
             vocab_size=len(tokenizer),
-            n_ctx=context_len,
+            n_ctx=n_ctx,
+            n_embd=n_embd,
+            n_head=n_head,
+            n_layer=n_layer,
+            n_positions=n_positions,
             bos_token_id=tokenizer.bos_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )

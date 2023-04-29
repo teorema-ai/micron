@@ -26,13 +26,12 @@ class DatasetsMixin:
     @classmethod
     def read(cls,
              root,
-             storage_options={},
              **unused_api_kwargs, 
              ):
         train_path, test_path = cls._dataset_paths(root)
-        train_dataframe = pd.read_parquet(train_path, storage_options=storage_options, engine="pyarrow") 
+        train_dataframe = pd.read_parquet(train_path, engine="pyarrow") 
         train_dataset = Dataset.from_pandas(train_dataframe, split='train')
-        test_dataframe = pd.read_parquet(test_path, storage_options=storage_options, engine="pyarrow")
+        test_dataframe = pd.read_parquet(test_path, engine="pyarrow")
         test_dataset = Dataset.from_pandas(test_dataframe, split='test')
         datasets = DatasetDict({splits.Split.TRAIN: train_dataset, splits.Split.TEST: test_dataset})
         return datasets 
@@ -44,7 +43,6 @@ class DatasetsMixin:
         valid = (train_filename in filelist) and (test_filename in filelist)
         return valid
     
-    # TODO: use `root` and `storage_options`
     def metric(self, root, **scope):
         filelist = os.listdir(root)
         train_filename, test_filename = self._dataset_paths()
@@ -82,7 +80,6 @@ class GRCh38(DatasetsMixin):
 
     def build(self,
               root,
-              storage_options={},
               *, 
               max_seqs=GRCh38_MAX_SEQS,
               min_subseq_len=GRCh38_MIN_SUBSEQ_LEN,
@@ -159,13 +156,12 @@ class GRCh38(DatasetsMixin):
     @classmethod
     def read(self,
              root,
-             storage_options={},
              **unused_api_kwargs, 
              ):
         train_path, test_path = self._dataset_paths(root)
-        train_dataframe = pd.read_parquet(train_path, storage_options=storage_options, engine="pyarrow") 
+        train_dataframe = pd.read_parquet(train_path, engine="pyarrow") 
         train_dataset = Dataset.from_pandas(train_dataframe, split='train')
-        test_dataframe = pd.read_parquet(test_path, storage_options=storage_options, engine="pyarrow")
+        test_dataframe = pd.read_parquet(test_path, engine="pyarrow")
         test_dataset = Dataset.from_pandas(test_dataframe, split='test')
         datasets = DatasetDict({splits.Split.TRAIN: train_dataset, splits.Split.TEST: test_dataset})
         return datasets 
@@ -275,7 +271,6 @@ class MiRNA(DatasetsMixin):
     
     def build(self,
               root,
-              storage_options={},
               *,
               train_fraction=0.9,):
         fs = fsspec.filesystem('http')
@@ -371,7 +366,6 @@ class Tokenizer:
     
     def build(self,
               root,
-              storage_options,
               *,
               datasets,
               tokenizer_trainer_chunk_size=TOKENIZER_TRAINER_CHUNK_SIZE,
@@ -417,7 +411,6 @@ class Tokenizer:
 
     def read(self,
              root,
-             storage_options={},
              **unused_api_kwargs, 
              ):
         filepath = os.path.join(root, 'tokenizer')
@@ -444,7 +437,6 @@ class TokenizedDatasets(DatasetsMixin):
     
     def build(self,
               root,
-              storage_options,
               *,
               datasets,
               tokenizer,
