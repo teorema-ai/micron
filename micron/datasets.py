@@ -24,38 +24,42 @@ class DatasetsMixin:
     """
         Must implement `_datasets_paths() -> tuple(train_filename, test_filename)`
     """
+    def __init__(self, root, filesystem: FileSystem):
+        self.root = root
+        self.filesystem = filesystem
+
+    # TODO: remove **unused_scope
     @classmethod
     def read(cls,
-             root,
-             fs: FileSystem,
-             **unused_api_kwargs, 
+             **unused_scope, 
              ):
         train_path, test_path = cls._dataset_paths(root)
-        train_table = pa.read_table(train_path, filesystem=fs)
+        train_table = pa.read_table(train_path, filesystem=self.filesystem)
         train_dataframe = train_table.to_pandas() 
         train_dataset = Dataset.from_pandas(train_dataframe, split='train')
-        test_table = pa.read_table(test_path, filesystem=fs)
+        test_table = pa.read_table(test_path, filesystem=self.filesystem)
         test_dataframe = test_table.to_pandas() 
         test_dataset = Dataset.from_pandas(test_dataframe, split='test')
         datasets = DatasetDict({splits.Split.TRAIN: train_dataset, splits.Split.TEST: test_dataset})
         return datasets 
 
-    # TODO: use `root` and `fs` instead of `filelist`
-    def valid(self, root, fs: FileSystem, **scope):
+    # TODO: remove **unused_scope
+    def valid(self, **unused_scope):
         train_filename, test_filename = self._dataset_paths()
-        filelist = fs.listdir(root, detail=False)
+        filelist = self.filesystem.listdir(self.root, detail=False)
         valid = (train_filename in filelist) and (test_filename in filelist)
         return valid
     
-    def metric(self, root, fs: FileSystem, **scope):
-        filelist = os.listdir(root)
+    # TODO: remove **unused_scope
+    def metric(self, **unused_scope):
+        filelist = os.listdir(self.root)
         train_filename, test_filename = self._dataset_paths()
         metric = (0, 0)
         if (train_filename in filelist) and (test_filename in filelist):
-            train_filepath = '/'.join([root, train_filename])
-            test_filepath = '/'.join([root, test_filename])
-            train_metadata = pd.read_metadata(train_filepath, filesystem=fs) 
-            test_metadata = pd.read_metadata(test_filepath, filesystem=fs)
+            train_filepath = '/'.join([self.root, train_filename])
+            test_filepath = '/'.join([self.root, test_filename])
+            train_metadata = pa.read_metadata(train_filepath, filesystem=self.filesystem) 
+            test_metadata = pa.read_metadata(test_filepath, filesystem=self.filesystem)
             metric = (train_metadata.num_rows, test_metadata.num_rows)
         return metric
 
@@ -76,11 +80,13 @@ class GRCh38(DatasetsMixin):
     def __init__(self,
                *,
                verbose=False,
-               rm_tmp=True,
+               use_tqdm=False,
                ray_client=None,):
         self.verbose = verbose
-        self.rm_tmp = rm_tmp
+        self.use_tqdm = use_tqdm
         self.ray_client = ray_client
+        # DEBUG
+        # print(f">>>>>>>>>>>>>>>>> verbose: {self.verbose}")
 
     def build(self,
               root,
@@ -91,42 +97,50 @@ class GRCh38(DatasetsMixin):
               max_subseq_len=GRCh38_MAX_SUBSEQ_LEN,
               train_fraction=GRCh38_TRAIN_FRACTION,
              ):
+        if self.verbose:
+            print(f"Building {self.__class__}")
         url=GRCh38_URL
         filename = GRCh38_FILENAME
         _fs = fsspec.filesystem('http')
         remote_fna = url+'/'+f'{filename}.fna.gz'
         local_fna = os.path.join(root, f'{filename}.fna.gz')
-        if not os.path.isfile(local_fna):
-            if self.verbose:
-                print(f"Downloading {remote_fna} to {local_fna}")
+        if self.verbose:
+            print(f"Downloading {remote_fna} to {local_fna} using filesystem {_fs}")
+        if self.use_tqdm:
             _fs.get(remote_fna, local_fna, callback=TqdmCallback())
+        else:
+            _fs.get(remote_fna, local_fna)
         if self.verbose:
             print(f"Parsing local copy {local_fna}")
         with gzip.open(local_fna, 'r') as seqfile:
             seqstr = seqfile.read().decode()
-            seqf = GRCh38._parse_sequences(seqstr)
-        if self.rm_tmp:
-            if self.verbose:
-                print(f"Removing local copy {local_fna}")
-            os.remove(local_fna)
+            seqf = self._parse_sequences(seqstr)
+        if self.verbose:
+            print(f"Removing local copy {local_fna}")
+        os.remove(local_fna)
 
         remote_gff = url+'/'+f'{filename}.gff.gz'
         local_gff = os.path.join(root, f'{filename}.gff.gz')
-        if not os.path.isfile(local_gff):
-            if self.verbose:
-                print(f"Downloading {remote_gff} to {local_gff}")
+        if self.verbose:
+            print(f"Downloading {remote_gff} to {local_gff}")
+        if self.use_tqdm:
             _fs.get(remote_gff, local_gff, callback=TqdmCallback())
+        else:
+            _fs.get(remote_gff, local_gff)
+                
         if self.verbose:
             print(f"Parsing local copy {local_gff}")
         with gzip.open(local_gff, 'r') as gfffile:
             gffstr = gfffile.read().decode()
-            annf = GRCh38._parse_annotations(gffstr)
-        if self.rm_tmp:
-            if self.verbose:
-                print(f"Removing local copy {local_gff}")
-            os.remove(local_gff)
-
-        subseqs_list = self._ray_extract_rna_subseqs(seqf, 
+            annf = self._parse_annotations(gffstr)
+        if self.verbose:
+            print(f"Removing local copy {local_gff}")
+        # FIX: use _fs.remove()
+        os.remove(local_gff)
+        
+        if self.verbose:
+            print(f"Extracting subsequences")
+        subseqs_list = GRCh38._ray_extract_rna_subseqs(seqf, 
                                                         annf, 
                                                         max_seqs=max_seqs,
                                                         min_subseq_len=min_subseq_len,
@@ -157,22 +171,6 @@ class GRCh38(DatasetsMixin):
         pq.write_table(test_dataset.data.table, test_path, filesystem=fs)
         if self.verbose:
             print(f"Wrote test dataset to {test_path}")
-   
-    """
-    @classmethod
-    def read(self,
-             root,
-             **unused_api_kwargs, 
-             ):
-        train_path, test_path = self._dataset_paths(root)
-        train_dataframe = pd.read_parquet(train_path, engine="pyarrow") 
-        train_dataset = Dataset.from_pandas(train_dataframe, split='train')
-        test_dataframe = pd.read_parquet(test_path, engine="pyarrow")
-        test_dataset = Dataset.from_pandas(test_dataframe, split='test')
-        datasets = DatasetDict({splits.Split.TRAIN: train_dataset, splits.Split.TEST: test_dataset})
-        return datasets 
-    """
-    
 
     @staticmethod
     def _dataset_paths(root=None):
@@ -180,8 +178,7 @@ class GRCh38(DatasetsMixin):
         test_path = os.path.join(root, f"{GRCh38_DATASET_FILENAME}.test.parquet",) if root is not None else f"{GRCh38_DATASET_FILENAME}.test.parquet"
         return train_path, test_path
 
-    @staticmethod
-    def _parse_annotations(gffstr):
+    def _parse_annotations(self, gffstr):
         gffstrs_ = gffstr.split('\n')
         gffstrs = [s for s in gffstrs_ if not s.startswith('#')]
         
@@ -191,9 +188,12 @@ class GRCh38(DatasetsMixin):
         gff['ID'] = attr.apply(lambda _: _[3:].split(';')[0].split(':')[0])
         return gff
     
-    @staticmethod
-    def _parse_sequences(seqstr):
+    def _parse_sequences(self, seqstr):
+        if self.verbose:
+            print(f"Parsing sequence string of length {len(seqstr)}")
         lines = seqstr.split('\n')
+        if self.verbose:
+            print(f"Split into {len(lines)} sequences")
         f_ = pd.DataFrame({'raw': lines})
         
         f_['key'] = None
@@ -220,7 +220,8 @@ class GRCh38(DatasetsMixin):
                                      seq_refs,
                                      min_subseq_len,
                                      max_subseq_len,
-                                     verbose):
+                                     verbose,
+                                     ):
         row = rna_ann_row
         if row.seqid not in seq_refs:
             return pd.Series([])
@@ -240,9 +241,10 @@ class GRCh38(DatasetsMixin):
             print(f"Finished subseqs with seqid: {row.seqid}, start: {start}, end: {end}, got {len(subseqs)} subseqs")
         return subseqs
     
-    def _ray_extract_rna_subseqs(self, seqs, ann, *, max_seqs=0, min_subseq_len, max_subseq_len, ray_client, verbose):
+    @staticmethod
+    def _ray_extract_rna_subseqs(seqs, ann, *, max_seqs=0, min_subseq_len, max_subseq_len, ray_client, verbose):
         if ray_client is None:
-            if self.verbose:
+            if verbose:
                 print(f"Spinning up ray_client")
             _ray_client = ray.init(dashboard_host="0.0.0.0")
         else:
@@ -261,7 +263,7 @@ class GRCh38(DatasetsMixin):
                 subseqs = [ray.get(ref) for ref in subseq_refs]
         finally:
             if ray_client is None:
-                if self.verbose:
+                if verbose:
                     print(f"Shutting down ray_client")
                 del _ray_client
         return subseqs
@@ -273,30 +275,39 @@ MIRNA_DATASET_FILENAME = f"miRNA"
 class MiRNA(DatasetsMixin):
     version = MIRNA_VERSION
 
-    def __init__(self, verbose=False, rm_tmp=True, ):
+    def __init__(self, root, filesystem: FileSystem, verbose=False, rm_tmp=True, ):
+        super().__init__(root, filesystem)
         self.verbose = verbose
         self.rm_tmp = rm_tmp
     
     def build(self,
-              root,
-              fs: FileSystem,
               *,
               train_fraction=0.9,):
+        """
+            Generate Huggingface dataset of MiRNA sequence samples.
+                train_fraction: float: ratio of train samples; the rest are test samples.
+        """
         fs = fsspec.filesystem('http')
 
         remote_dat = MIRNA_DATASET_URL + '/' + f'{MIRNA_DATASET_FILENAME}.dat.gz'
-        local_dat = os.path.join(root, f'{MIRNA_DATASET_FILENAME}.dat.gz')
-        if not os.path.isfile(local_dat):
+        local_dat = os.path.join(self.root, f'{MIRNA_DATASET_FILENAME}.dat.gz')
+        loaded = False
+        load = False
+        while not loaded:
+            if load:
+                if self.verbose:
+                    print(f"Downloading {remote_dat} to {local_dat}")
+                fs.get(remote_dat, local_dat, callback=TqdmCallback())
+                load = False
+                loaded = True
             if self.verbose:
-                print(f"Downloading {remote_dat} to {local_dat}")
-            fs.get(remote_dat, local_dat, callback=TqdmCallback())
-        if self.verbose:
-            print(f"Parsing local copy {local_dat}")
-        with gzip.open(local_dat, 'r') as datfile:
-            datstr = datfile.read().decode()
-            frame = self._build_frame(datstr)
+                print(f"Trying to parse local copy {local_dat}")
+            with gzip.open(local_dat, 'r') as datfile:
+                datstr = datfile.read().decode()
+                frame = self._build_frame(datstr)
+                loaded = True
 
-        train_path, test_path = self._dataset_paths(root)
+        train_path, test_path = self._dataset_paths(self.root)
 
         train_dataset = Dataset.from_pandas(frame.iloc[:int(train_fraction*len(frame))], split='train')
         if self.verbose:
@@ -304,13 +315,12 @@ class MiRNA(DatasetsMixin):
         test_dataset = Dataset.from_pandas(frame.iloc[int(train_fraction*len(frame)):], split='test')
         if self.verbose:
             print(f"Built test dataset from dataframe with train_fraction {train_fraction}")
-        pq.write_table(train_dataset.data.table, train_path, flesystem=fs)
+        pq.write_table(train_dataset.data.table, train_path, flesystem=self.filesystem)
         if self.verbose:
             print(f"Wrote train dataset to {train_path}")
-        pq.write_table(test_dataset.data.table, test_path, filesystem=fs)
+        pq.write_table(test_dataset.data.table, test_path, filesystem=self.filesystem)
         if self.verbose:
             print(f"Wrote test dataset to {test_path}")
-    
     
     @staticmethod
     def _dataset_paths(root=None):
