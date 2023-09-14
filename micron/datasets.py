@@ -1,503 +1,113 @@
-from functools import reduce
-from io import StringIO
-import logging
+from dataclasses import dataclass
+
 import os
 
 import fsspec
 from fsspec.callbacks import TqdmCallback
-from fsspec import AbstractFileSystem as FileSystem
-import gzip
+import tarfile
+import tempfile
 
-import numpy as np
 import pandas as pd
-import pyarrow as pa
 import pyarrow.parquet as pq
 
 import ray
 
-from datasets import Dataset, DatasetDict, load_dataset, splits
-import tokenizers
-import transformers
+
+class Dataset:
+    @dataclass
+    class SCOPE:
+        pass
+        
+    def __init__(self, debug: bool):
+        self.debug = debug
+
+    def build(self, 
+             scope: SCOPE=SCOPE(), 
+             filesystem: fsspec.AbstractFileSystem=fsspec.filesystem("file"),
+             root:str=os.getcwd(), 
+        ):
+        raise NotImplementedError()
+        
+    def read(self, 
+             scope: SCOPE=SCOPE(), 
+             filesystem: fsspec.AbstractFileSystem=fsspec.filesystem("file"),
+             root:str=os.getcwd(), 
+        ):
+        raise NotImplementedError()
+
+    def valid(self, 
+             scope: SCOPE=SCOPE(), 
+             filesystem: fsspec.AbstractFileSystem=fsspec.filesystem("file"),
+             root:str=os.getcwd(), 
+        ):
+        raise NotImplementedError()
+    
+    def metric(self, 
+             scope: SCOPE=SCOPE(), 
+             filesystem: fsspec.AbstractFileSystem=fsspec.filesystem("file"),
+             root:str=os.getcwd(), 
+        ):
+        raise NotImplementedError()
 
 
-class DatasetsMixin:
+
+class HNSCCountsMiRNA(Dataset):
     """
-        Must implement `_datasets_paths() -> tuple(train_filename, test_filename)`
+        Data for the clustering HNSC study described in from https://www.ncbi.nlm.nih.gov/pmc/articles/PMC7854517/.
     """
-    def __init__(self, root, filesystem: FileSystem):
-        self.root = root
-        self.filesystem = filesystem
+    VERSION = "0.0.1"
+    MIRNA_SRC_URL = "https://gdac.broadinstitute.org/runs/stddata__2016_01_28/data/HNSC/20160128/"
+    MIRNA_SRC_TAR_DIRNAME = "gdac.broadinstitute.org_HNSC.miRseq_Mature_Preprocess.Level_3.2016012800.0.0"
+    MIRNA_SRC_DAT_FILENAME = "HNSC.miRseq_mature_RPM_log2.txt"
+    MIRNA_TGT_DAT_FILENAME = f"mirna_rpm_log2.parquet"
 
-    # TODO: remove **unused_scope
-    @classmethod
-    def read(cls,
-             **unused_scope, 
-             ):
-        train_path, test_path = cls._dataset_paths(root)
-        train_table = pa.read_table(train_path, filesystem=self.filesystem)
-        train_dataframe = train_table.to_pandas() 
-        train_dataset = Dataset.from_pandas(train_dataframe, split='train')
-        test_table = pa.read_table(test_path, filesystem=self.filesystem)
-        test_dataframe = test_table.to_pandas() 
-        test_dataset = Dataset.from_pandas(test_dataframe, split='test')
-        datasets = DatasetDict({splits.Split.TRAIN: train_dataset, splits.Split.TEST: test_dataset})
-        return datasets 
-
-    # TODO: remove **unused_scope
-    def valid(self, **unused_scope):
-        train_filename, test_filename = self._dataset_paths()
-        filelist = self.filesystem.listdir(self.root, detail=False)
-        valid = (train_filename in filelist) and (test_filename in filelist)
-        return valid
-    
-    # TODO: remove **unused_scope
-    def metric(self, **unused_scope):
-        filelist = os.listdir(self.root)
-        train_filename, test_filename = self._dataset_paths()
-        metric = (0, 0)
-        if (train_filename in filelist) and (test_filename in filelist):
-            train_filepath = '/'.join([self.root, train_filename])
-            test_filepath = '/'.join([self.root, test_filename])
-            train_metadata = pa.read_metadata(train_filepath, filesystem=self.filesystem) 
-            test_metadata = pa.read_metadata(test_filepath, filesystem=self.filesystem)
-            metric = (train_metadata.num_rows, test_metadata.num_rows)
-        return metric
-
-GRCh38_URL = "https://ftp.ncbi.nlm.nih.gov/refseq/H_sapiens/annotation/GRCh38_latest/refseq_identifiers"
-GRCh38_FILENAME = "GRCh38_latest_genomic"
-
-GRCh38_DATASET_FILENAME = "GRCh38"
-GRCh38_VERSION = "0.0.1"
-
-GRCh38_MAX_SEQS = 0
-GRCh38_MIN_SUBSEQ_LEN = 10
-GRCh38_MAX_SUBSEQ_LEN = 30
-GRCh38_TOKENIZER_MAX_LEN = 50
-GRCh38_TRAIN_FRACTION = 0.9
-
-class GRCh38(DatasetsMixin):
-    version = GRCh38_VERSION
-    def __init__(self,
-               *,
-               verbose=False,
-               use_tqdm=False,
-               ray_client=None,):
-        self.verbose = verbose
-        self.use_tqdm = use_tqdm
-        self.ray_client = ray_client
-        # DEBUG
-        # print(f">>>>>>>>>>>>>>>>> verbose: {self.verbose}")
-
-    def build(self,
-              root,
-              fs: FileSystem,
-              *, 
-              max_seqs=GRCh38_MAX_SEQS,
-              min_subseq_len=GRCh38_MIN_SUBSEQ_LEN,
-              max_subseq_len=GRCh38_MAX_SUBSEQ_LEN,
-              train_fraction=GRCh38_TRAIN_FRACTION,
-             ):
-        if self.verbose:
-            print(f"Building {self.__class__}")
-        url=GRCh38_URL
-        filename = GRCh38_FILENAME
-        _fs = fsspec.filesystem('http')
-        remote_fna = url+'/'+f'{filename}.fna.gz'
-        local_fna = os.path.join(root, f'{filename}.fna.gz')
-        if self.verbose:
-            print(f"Downloading {remote_fna} to {local_fna} using filesystem {_fs}")
-        if self.use_tqdm:
-            _fs.get(remote_fna, local_fna, callback=TqdmCallback())
-        else:
-            _fs.get(remote_fna, local_fna)
-        if self.verbose:
-            print(f"Parsing local copy {local_fna}")
-        with gzip.open(local_fna, 'r') as seqfile:
-            seqstr = seqfile.read().decode()
-            seqf = self._parse_sequences(seqstr)
-        if self.verbose:
-            print(f"Removing local copy {local_fna}")
-        os.remove(local_fna)
-
-        remote_gff = url+'/'+f'{filename}.gff.gz'
-        local_gff = os.path.join(root, f'{filename}.gff.gz')
-        if self.verbose:
-            print(f"Downloading {remote_gff} to {local_gff}")
-        if self.use_tqdm:
-            _fs.get(remote_gff, local_gff, callback=TqdmCallback())
-        else:
-            _fs.get(remote_gff, local_gff)
-                
-        if self.verbose:
-            print(f"Parsing local copy {local_gff}")
-        with gzip.open(local_gff, 'r') as gfffile:
-            gffstr = gfffile.read().decode()
-            annf = self._parse_annotations(gffstr)
-        if self.verbose:
-            print(f"Removing local copy {local_gff}")
-        # FIX: use _fs.remove()
-        os.remove(local_gff)
-        
-        if self.verbose:
-            print(f"Extracting subsequences")
-        subseqs_list = GRCh38._ray_extract_rna_subseqs(seqf, 
-                                                        annf, 
-                                                        max_seqs=max_seqs,
-                                                        min_subseq_len=min_subseq_len,
-                                                        max_subseq_len=max_subseq_len,
-                                                        ray_client=self.ray_client,
-                                                        verbose=self.verbose)
-        if self.verbose:
-            print(f"Extracted subsequences, concatenating ...")
-        subseqs = pd.concat(subseqs_list)
-        if self.verbose:
-            print(f"Done concatenating, normalizing ...")
-        subseqf = pd.DataFrame({'sequence': subseqs})
-        subseqf['sequence'] = subseqf.sequence.apply(GRCh38._normalize_sequence)
-        if self.verbose:
-            print(f"Done normalizing.  DataFrame complete.")
-
-        train_path, test_path = self._dataset_paths(root)
-
-        train_dataset = Dataset.from_pandas(subseqf.iloc[:int(train_fraction*len(subseqf))], split='train')
-        if self.verbose:
-            print(f"Built train dataset from dataframe with train_fraction {train_fraction}")
-        test_dataset = Dataset.from_pandas(subseqf.iloc[int(train_fraction*len(subseqf)):], split='test')
-        if self.verbose:
-            print(f"Built test dataset from dataframe with train_fraction {train_fraction}")
-        pq.write_table(train_dataset.data.table, train_path, filesystem=fs)
-        if self.verbose:
-            print(f"Wrote train dataset to {train_path}")
-        pq.write_table(test_dataset.data.table, test_path, filesystem=fs)
-        if self.verbose:
-            print(f"Wrote test dataset to {test_path}")
-
-    @staticmethod
-    def _dataset_paths(root=None):
-        train_path = os.path.join(root, f"{GRCh38_DATASET_FILENAME}.train.parquet",) if root is not None else f"{GRCh38_DATASET_FILENAME}.train.parquet"
-        test_path = os.path.join(root, f"{GRCh38_DATASET_FILENAME}.test.parquet",) if root is not None else f"{GRCh38_DATASET_FILENAME}.test.parquet"
-        return train_path, test_path
-
-    def _parse_annotations(self, gffstr):
-        gffstrs_ = gffstr.split('\n')
-        gffstrs = [s for s in gffstrs_ if not s.startswith('#')]
-        
-        gffio = StringIO('\n'.join(gffstrs))
-        gff = pd.read_csv(gffio, sep='\t', names=['seqid', 'source', 'type', 'start', 'end', 'score', 'strand', 'phase', 'attributes'])
-        attr = gff.attributes.str.strip()
-        gff['ID'] = attr.apply(lambda _: _[3:].split(';')[0].split(':')[0])
-        return gff
-    
-    def _parse_sequences(self, seqstr):
-        if self.verbose:
-            print(f"Parsing sequence string of length {len(seqstr)}")
-        lines = seqstr.split('\n')
-        if self.verbose:
-            print(f"Split into {len(lines)} sequences")
-        f_ = pd.DataFrame({'raw': lines})
-        
-        f_['key'] = None
-        f_['is_key'] = f_.raw.str.startswith('>')
-        keymask = f_['is_key']
-        f_.loc[keymask, 'ID'] = f_[keymask]['raw'].apply(lambda s: s[1:].split(' ')[0])
-        f_['key'] = f_['is_key'].cumsum()
-        
-        keyf = f_[keymask].set_index('key') 
-        seqf = pd.DataFrame({'seq': f_.loc[~keymask].groupby('key').apply(lambda g: ''.join(g.raw))})
-        seqf['seqid'] = keyf['ID']
-        
-        seqf['seqlen'] = seqf.seq.str.len()
-        seqf['offset'] = seqf['seqlen'].cumsum().shift(1).fillna(0).astype(int)
-        return seqf
-    
-    @staticmethod
-    def _normalize_sequence(s):
-        s_ = s.upper().replace('T', 'U')
-        return s_
-
-    @staticmethod
-    def _ray_row_extract_rna_subseqs(rna_ann_row, 
-                                     seq_refs,
-                                     min_subseq_len,
-                                     max_subseq_len,
-                                     verbose,
-                                     ):
-        row = rna_ann_row
-        if row.seqid not in seq_refs:
-            return pd.Series([])
-        seq_ref = seq_refs[row.seqid]
-        seq = ray.get(seq_ref)
-        start, end = row.start-1, row.end
-        N = (end-start)//min_subseq_len
-        lens = pd.Series(np.random.randint(min_subseq_len, max_subseq_len, N))
-        ends = (start + lens.cumsum()).apply(lambda _: min(_, end))
-        starts = ends.shift(1).fillna(start).astype('int')
-        
-        limits_ = pd.DataFrame({'start': starts, 'end': ends})
-        limits = limits_[limits_.start < limits_.end]
-        #print(limits)
-        subseqs = limits.apply(lambda _: seq[_.start:_.end], axis=1)
-        if verbose:
-            print(f"Finished subseqs with seqid: {row.seqid}, start: {start}, end: {end}, got {len(subseqs)} subseqs")
-        return subseqs
-    
-    @staticmethod
-    def _ray_extract_rna_subseqs(seqs, ann, *, max_seqs=0, min_subseq_len, max_subseq_len, ray_client, verbose):
-        if ray_client is None:
-            if verbose:
-                print(f"Spinning up ray_client")
-            _ray_client = ray.init(dashboard_host="0.0.0.0")
-        else:
-            _ray_client = ray_client
-        try:
-
-            seq_refs = {row.seqid: ray.put(row.seq) for i, row in seqs.iterrows() if max_seqs == 0 or i < max_seqs}
-
-            rna_ann_ = ann[ann.type.str.find('RNA') != -1]
-            rna_ann = rna_ann_[rna_ann_.seqid.isin(seq_refs.keys())]
-            with _ray_client:
-                subseq_refs = rna_ann.apply(lambda row, seq_refs, min_subseq_len, max_subseq_len, verbose: \
-                                            ray.remote(GRCh38._ray_row_extract_rna_subseqs).remote(row, seq_refs, min_subseq_len, max_subseq_len, verbose), 
-                                            args=(seq_refs,min_subseq_len, max_subseq_len, verbose), 
-                                            axis=1)
-                subseqs = [ray.get(ref) for ref in subseq_refs]
-        finally:
-            if ray_client is None:
-                if verbose:
-                    print(f"Shutting down ray_client")
-                del _ray_client
-        return subseqs
-
-
-MIRNA_VERSION = "0.0.1"
-MIRNA_DATASET_URL = "https://mirbase.org/ftp/CURRENT"
-MIRNA_DATASET_FILENAME = f"miRNA"
-class MiRNA(DatasetsMixin):
-    version = MIRNA_VERSION
-
-    def __init__(self, root, filesystem: FileSystem, verbose=False, rm_tmp=True, ):
-        super().__init__(root, filesystem)
+    def __init__(self, debug=False, verbose=False, rm_tmp=True, ):
+        super().__init__(debug)
         self.verbose = verbose
         self.rm_tmp = rm_tmp
     
-    def build(self,
-              *,
-              train_fraction=0.9,):
+    def build(self, scope: Dataset.SCOPE=Dataset.SCOPE(), filesystem: fsspec.AbstractFileSystem=fsspec.filesystem("file"), root: str=os.getcwd()):
         """
-            Generate Huggingface dataset of MiRNA sequence samples.
-                train_fraction: float: ratio of train samples; the rest are test samples.
+            Generate a pandas dataframe of TCGA HNSC mature MiRNA sequence samples.
         """
+        if self.verbose:
+            print("Building HNSCCountsMiRNA")
         fs = fsspec.filesystem('http')
-
-        remote_dat = MIRNA_DATASET_URL + '/' + f'{MIRNA_DATASET_FILENAME}.dat.gz'
-        local_dat = os.path.join(self.root, f'{MIRNA_DATASET_FILENAME}.dat.gz')
-        loaded = False
-        load = False
-        while not loaded:
-            if load:
-                if self.verbose:
-                    print(f"Downloading {remote_dat} to {local_dat}")
-                fs.get(remote_dat, local_dat, callback=TqdmCallback())
-                load = False
-                loaded = True
+        with tempfile.TemporaryDirectory() as tmpdir:
+            remote_tarpath = self.MIRNA_SRC_URL + '/' + self.MIRNA_SRC_TAR_DIRNAME + ".tar.gz"
+            local_tarpath = os.path.join(tmpdir, self.MIRNA_SRC_TAR_DIRNAME) + ".tar.gz"
             if self.verbose:
-                print(f"Trying to parse local copy {local_dat}")
-            with gzip.open(local_dat, 'r') as datfile:
-                datstr = datfile.read().decode()
-                frame = self._build_frame(datstr)
-                loaded = True
-
-        train_path, test_path = self._dataset_paths(self.root)
-
-        train_dataset = Dataset.from_pandas(frame.iloc[:int(train_fraction*len(frame))], split='train')
-        if self.verbose:
-            print(f"Built train dataset from dataframe with train_fraction {train_fraction}")
-        test_dataset = Dataset.from_pandas(frame.iloc[int(train_fraction*len(frame)):], split='test')
-        if self.verbose:
-            print(f"Built test dataset from dataframe with train_fraction {train_fraction}")
-        pq.write_table(train_dataset.data.table, train_path, flesystem=self.filesystem)
-        if self.verbose:
-            print(f"Wrote train dataset to {train_path}")
-        pq.write_table(test_dataset.data.table, test_path, filesystem=self.filesystem)
-        if self.verbose:
-            print(f"Wrote test dataset to {test_path}")
+                print(f"Downloading {remote_tarpath} to {local_tarpath}")
+            fs.get(remote_tarpath, local_tarpath, callback=TqdmCallback())
+            assert os.path.isfile(local_tarpath)
+            if self.verbose:
+                print(f"Trying to parse local copy {local_tarpath}")
+            _tardir = os.path.join(tmpdir, self.MIRNA_SRC_TAR_DIRNAME)
+            with tarfile.open(local_tarpath, 'r') as _tarfile:
+                if self.verbose:
+                    print(f"Extracting {local_tarpath} to {_tardir}")
+                _tarfile.extractall(tmpdir)
+            if self.debug:
+                print(f"DEBUG: extracted dir: {os.listdir(_tardir)}")
+            _datpath = os.path.join(_tardir, self.MIRNA_SRC_DAT_FILENAME)
+            frame = pd.read_csv(_datpath, sep='\t', header=0, index_col=0)
+            frame_path = root + "/" + self.MIRNA_TGT_DAT_FILENAME       
+            frame.to_parquet(frame_path, storage_options=filesystem.storage_options)
+            if self.verbose:
+                print(f"Wrote dataframe to {frame_path}")
+            return frame_path
     
-    @staticmethod
-    def _dataset_paths(root=None):
-        train_path = os.path.join(root, f"{MIRNA_DATASET_FILENAME}.train.parquet",) if root is not None else f"{MIRNA_DATASET_FILENAME}.train.parquet"
-        test_path = os.path.join(root, f"{MIRNA_DATASET_FILENAME}.test.parquet",) if root is not None else f"{MIRNA_DATASET_FILENAME}.test.parquet"
-        return train_path, test_path
-
-    def _build_frame(self, mdstr):
-        recs = MiRNA._parse_records(mdstr)
-        f = pd.DataFrame.from_records(recs)
-        frame = f.sort_values('ID').reset_index(drop=True)
-        if self.verbose:
-            print(f"Built dataframe")
+    def read(self, scope: Dataset.SCOPE=Dataset.SCOPE(), filesystem: fsspec.AbstractFileSystem=fsspec.filesystem("file"), root: str=os.getcwd()):
+        frame_path = os.path.join(root, self.MIRNA_TGT_DAT_FILENAME)        
+        frame = pd.read_parquet(frame_path, storage_options=filesystem.storage_options)
         return frame
-
-    @staticmethod     
-    def _parse_records(mdstr):
-        _mdstrs = mdstr.split('\nID')
-        mdstrs = [f"ID{s}" for s in _mdstrs]
-        _prerecs = [MiRNA._parse_prerecord(s) for s in mdstrs]
-        prerecs = [pr for pr in _prerecs if pr['DE'].find('sapiens') != -1]
-        recs = [MiRNA._prerecord_to_record(pr) for pr in prerecs]
-        return recs
-
-    @staticmethod
-    def _parse_prerecord(recstr):
-        sqstart = recstr.find('SQ')+2
-        sqend = recstr.find('//')
-        sq = recstr[sqstart:sqend]
-        recstrs = recstr.split('\n')
-        rec_ = {s[:2]: s[3:] for s in recstrs}
-        _rec = {k: v.strip() for k, v in rec_.items() if k in ['ID', 'AC', 'DE']}
-        _rec['SQ'] = sq
-        return _rec
-
-    @staticmethod
-    def _prerecord_to_record(prerec):
-        rec = {}
-        _id = prerec['ID'].split(' ')[0]
-        rec['ID'] = _id
-        _ac = prerec['AC']
-        rec['Accession'] = _ac[:-1] if _ac[-1] == ';' else _ac
-        sq_ = prerec['SQ']
-        sq_strs_ = sq_.split('\n')[1:-1]
-        _sq = ''.join([s[:-2].strip() for s in sq_strs_])
-        sq = ''.join([s.strip() for s in _sq.split(' ')])
-        rec['sequence'] = ''.join([c for c in sq.upper() if c in ['A', 'C', 'G', 'U']])
-        return rec
-
-
-TOKENIZER_VERSION = '0.0.1'
-TOKENIZER_TRAINER_CHUNK_SIZE = 200
-TOKENIZER_TRAINER_VOCAB_SIZE = 100
-TOKENIZER_FILENAME = 'tokenizer'
-TOKENIZER_MAX_LEN = 50
-
-class Tokenizer:
-    version = TOKENIZER_VERSION
-
-    def __init__(self, verbose=False):
-        self.verbose = verbose
     
-    def build(self,
-              root,
-              *,
-              datasets,
-              tokenizer_trainer_chunk_size=TOKENIZER_TRAINER_CHUNK_SIZE,
-              tokenizer_trainer_vocab_size=TOKENIZER_TRAINER_CHUNK_SIZE,
-              ):
-
-        _datasets = datasets
-        _tokenizer = tokenizers.Tokenizer(tokenizers.models.BPE())
-        #_tokenizer.normalizer = tokenizers.normalizers.Sequence(
-        #    []
-        #)
-        #_tokenizer.pre_tokenizer = tokenizers.pre_tokenizers.Sequence(
-        #    [tokenizers.pre_tokenizers.WhitespaceSplit(), tokenizers.pre_tokenizers.Punctuation()]
-        #)
-        #_tokenizer.pre_tokenizer = tokenizers.pre_tokenizers.Sequence(
-        #    [tokenizers.pre_tokenizers.Punctuation()]
-        #)
-        _tokenizer_trainer = tokenizers.trainers.BpeTrainer(vocab_size=tokenizer_trainer_vocab_size, special_tokens=["<|startoftext|>", "<|endoftext|>"])
-        _tokenizer_generator = self._tokenizer_training_corpus_generator(_datasets, chunk_size=tokenizer_trainer_chunk_size) 
-        _tokenizer.train_from_iterator(_tokenizer_generator,
-                                       trainer=_tokenizer_trainer)
-        #_tokenizer.post_processor = tokenizers.processors.ByteLevel(trim_offsets=False)
-        _tokenizer.decoder = tokenizers.decoders.ByteLevel()
-
-        filepath = os.path.join(root, TOKENIZER_FILENAME)
-        _tokenizer.save(filepath)
-        if self.verbose:
-            print(f"Saved tokenizer to {filepath}")
-
-    def valid(self, root, **scope):
-        filename = TOKENIZER_FILENAME
-        filelist = os.listdir(root)
-        valid = filename in filelist
+    def valid(self, scope: Dataset.SCOPE=Dataset.SCOPE(), filesystem: fsspec.AbstractFileSystem=fsspec.filesystem("file"), root: str=os.getcwd()):
+        frame_path = os.path.join(root, self.MIRNA_TGT_DAT_FILENAME)        
+        valid = filesystem.isfile(frame_path)
         return valid
-    
-    @staticmethod    
-    def _tokenizer_training_corpus_generator(dataset_dict, *, chunk_size):
-        dd = dataset_dict
-        sequence_list = reduce(lambda sequence, ds: sequence+ds['sequence'] if sequence is not None else ds['sequence'], dd.values(), None)
-        for i in range(0, len(sequence_list), chunk_size):
-            chunk = sequence_list[i:i+chunk_size]
-            yield chunk
 
-    def read(self,
-             root,
-             **unused_api_kwargs, 
-             ):
-        filepath = os.path.join(root, 'tokenizer')
-        if self.verbose: 
-            print(f"Loading tokenizer from {filepath}")
-        _tokenizer = tokenizers.Tokenizer.from_file(filepath)
-
-        tokenizer = transformers.PreTrainedTokenizerFast(
-            tokenizer_object=_tokenizer,
-            bos_token="<|startoftext|>",
-            eos_token="<|endoftext|>",
-        )
-        tokenizer.pad_token = tokenizer.eos_token
-        return tokenizer
-
-
-TOKENIZED_DATASET_VERSION = '0.0.1'
-TOKENIZED_DATASET_MAX_LEN = 10
-TOKENIZED_DATASET_NUM_PROC = 24
-class TokenizedDatasets(DatasetsMixin):
-    def __init__(self, verbose=False, num_proc=TOKENIZED_DATASET_NUM_PROC):
-        self.verbose = verbose
-        self.num_proc = num_proc
-    
-    def build(self,
-              root,
-              fs: FileSystem,
-              *,
-              datasets,
-              tokenizer,
-              max_len=TOKENIZED_DATASET_MAX_LEN,
-              ):
-        tokenized_datasets = self.tokenize_datasets(tokenizer, 
-                                                    datasets, 
-                                                    max_len=max_len,
-                                                    num_proc=self.num_proc)
-        tokenized_train_path = os.path.join(root, f"tokenized.train.parquet",)
-        tokenized_test_path = os.path.join(root, f"tokenized.test.parquet",)
-        if self.verbose:
-            print(f"Tokenized train and test datasets from {datasets} using tokenizer {tokenizer}")
-        pq.write_table(tokenized_datasets['train'].data.table, tokenized_train_path, filesystem=fs)
-        if self.verbose:
-            print(f"Wrote tokenized train dataset to {tokenized_train_path}")
-        pq.write_table(tokenized_datasets['test'].data.table, tokenized_test_path, filesystem=fs)
-        if self.verbose:
-            print(f"Wrote tokenized test dataset to {tokenized_test_path}")
-
-    @staticmethod
-    def _dataset_paths(root=None):
-        tokenized_train_path = os.path.join(root, f"tokenized.train.parquet",) if root is not None else "tokenized.train.parquet"
-        tokenized_test_path = os.path.join(root, f"tokenized.test.parquet",) if root is not None else "tokenized.test.parquet"
-        return tokenized_train_path, tokenized_test_path
-
-    def tokenize_datasets(self, tokenizer, datasets, *, max_len, num_proc=1):
-        if self.verbose:
-            print(f"Tokenizing datasets using {num_proc} procs")
-        def tokenize_row(row, *, context_length=max_len):
-            outputs = tokenizer(
-                row['sequence'],
-                truncation=True,
-                max_length=max_len,
-                return_overflowing_tokens=True,
-                return_length=True,
-            )
-            return outputs
-        
-        tokenized_datasets = datasets.map(tokenize_row, 
-                                          batched=True, 
-                                          num_proc=num_proc,
-                                          remove_columns=datasets["train"].column_names)
-        return tokenized_datasets
+    def metric(self, scope: Dataset.SCOPE=Dataset.SCOPE(), filesystem: fsspec.AbstractFileSystem=fsspec.filesystem("file"), root: str=os.getcwd()):
+        frame_path = os.path.join(root, self.MIRNA_TGT_DAT_FILENAME)        
+        valid = filesystem.isfile(frame_path)
+        return int(valid)

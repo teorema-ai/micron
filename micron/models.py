@@ -10,7 +10,7 @@ from datasets import DatasetDict
 
 import plotly.graph_objects as go
 
-import micron.midatasets
+import micron.hfdatasets
 
 
 def setup_torch(gpu, *, verbose=True):
@@ -28,7 +28,7 @@ def torch_setup():
 
 
 GPT2_VERSION = "0.1.1"
-GPT2_CONTEXT_LEN = micron.midatasets.TOKENIZER_MAX_LEN
+GPT2_CONTEXT_LEN = micron.hfdatasets.TOKENIZER_MAX_LEN
 GPT2_NUM_EPOCHS = 3
 GPT2_LEARNING_RATE = 2e-5
 GPT2_WEIGHT_DECAY = 0.01

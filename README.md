@@ -2,13 +2,6 @@
 LLM for miRNA space learning.
 
 # SETUP
-* datablocks
-    - dev: 
-    ```
-        git clone git@github.com:pearson-laboratory/datablocks.git $HOME/datablocks
-        pip install -e $HOME/datablocks 
-    ```
-    - prod: #TODO
 * micron
     - dev: 
     ```
