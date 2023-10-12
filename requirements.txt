@@ -2,4 +2,5 @@ biopython==1.81
 fsspec==2023.1.0
 gunzip==0.1.10
 jupyterlab_limit_output==1.0.0
+pyckmeans==0.9.4
 
