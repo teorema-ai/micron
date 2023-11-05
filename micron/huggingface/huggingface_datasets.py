@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 from functools import reduce
 from io import StringIO
 import logging
@@ -19,7 +21,126 @@ import tokenizers
 import transformers
 
 
-class DatasetsMixin:
+class miRNA:
+    VERSION = "0.0.1"
+
+    @dataclass
+    class SCOPE:
+        train_fraction: int = 0.9
+
+    MIRNA_DATASET_URL = "https://mirbase.org/download"
+    MIRNA_DATASET_FILENAME = f"miRNA"
+
+    def __init__(self, verbose=False, debug=False, rm_tmp=True, ):
+        self.verbose = verbose
+        self.debug = debug
+        self.rm_tmp = rm_tmp
+    
+    def build(self,
+              root,
+              *,
+              scope: SCOPE = SCOPE(),
+              filesystem: fsspec.AbstractFileSystem = fsspec.filesystem("file")):
+        
+        root = root or os.getcwd()
+        fs = fsspec.filesystem('http')
+
+        remote_dat = self.MIRNA_DATASET_URL + '/' + f'{self.MIRNA_DATASET_FILENAME}.dat'
+        local_dat = os.path.join(root, f'{self.MIRNA_DATASET_FILENAME}.dat')
+        if not os.path.isfile(local_dat):
+            if self.verbose:
+                print(f"Downloading {remote_dat} to {local_dat}")
+            fs.get(remote_dat, local_dat, callback=TqdmCallback())
+        if self.verbose:
+            print(f"Parsing local copy {local_dat}")
+
+        if local_dat.endswith('.gz'):
+            with gzip.open(local_dat, 'r') as datfile:
+                datstr = datfile.read().decode()
+                frame = self._build_frame(datstr)
+        else:
+            with open(local_dat, 'r') as datfile:
+                datstr = datfile.read()
+                frame = self._build_frame(datstr)
+
+        train_path, test_path = self.paths(root)
+        train_dataset = Dataset.from_pandas(frame.iloc[:int(scope.train_fraction*len(frame))], split='train')
+        if self.verbose:
+            print(f"Built train dataset from dataframe with train_fraction {scope.train_fraction}")
+        test_dataset = Dataset.from_pandas(frame.iloc[int(scope.train_fraction*len(frame)):], split='test')
+        if self.verbose:
+            print(f"Built test dataset from dataframe with train_fraction {scope.train_fraction}")
+        pq.write_table(train_dataset.data.table, train_path, filesystem=filesystem)
+        if self.verbose:
+            print(f"Wrote train dataset to {train_path}")
+        pq.write_table(test_dataset.data.table, test_path, filesystem=filesystem)
+        if self.verbose:
+            print(f"Wrote test dataset to {test_path}")
+
+    def read(self,
+              root,
+              *,
+              filesystem: fsspec.AbstractFileSystem = fsspec.filesystem("file")
+    ):
+        #FIX: use filesystem
+        train_path, test_path = self.paths(root)
+        train_dataframe = pd.read_parquet(train_path, engine="pyarrow") 
+        train_dataset = Dataset.from_pandas(train_dataframe, split='train')
+        test_dataframe = pd.read_parquet(test_path, engine="pyarrow")
+        test_dataset = Dataset.from_pandas(test_dataframe, split='test')
+        datasets = DatasetDict({splits.Split.TRAIN: train_dataset, splits.Split.TEST: test_dataset})
+        return datasets 
+
+    def paths(self, root):
+        train_path = os.path.join(root, f"{self.MIRNA_DATASET_FILENAME}.train.parquet",) 
+        test_path = os.path.join(root, f"{self.MIRNA_DATASET_FILENAME}.test.parquet",) 
+        return train_path, test_path
+
+    
+    def _build_frame(self, mdstr):
+        recs = miRNA._parse_records(mdstr)
+        f = pd.DataFrame.from_records(recs)
+        frame = f.sort_values('ID').reset_index(drop=True)
+        if self.verbose:
+            print(f"Built dataframe")
+        return frame
+
+    @staticmethod     
+    def _parse_records(mdstr):
+        _mdstrs = mdstr.split('\nID')
+        mdstrs = [f"ID{s}" for s in _mdstrs]
+        _prerecs = [miRNA._parse_prerecord(s) for s in mdstrs]
+        prerecs = [pr for pr in _prerecs if pr['DE'].find('sapiens') != -1]
+        recs = [miRNA._prerecord_to_record(pr) for pr in prerecs]
+        return recs
+
+    @staticmethod
+    def _parse_prerecord(recstr):
+        sqstart = recstr.find('SQ')+2
+        sqend = recstr.find('//')
+        sq = recstr[sqstart:sqend]
+        recstrs = recstr.split('\n')
+        rec_ = {s[:2]: s[3:] for s in recstrs}
+        _rec = {k: v.strip() for k, v in rec_.items() if k in ['ID', 'AC', 'DE']}
+        _rec['SQ'] = sq
+        return _rec
+
+    @staticmethod
+    def _prerecord_to_record(prerec):
+        rec = {}
+        _id = prerec['ID'].split(' ')[0]
+        rec['ID'] = _id
+        _ac = prerec['AC']
+        rec['Accession'] = _ac[:-1] if _ac[-1] == ';' else _ac
+        sq_ = prerec['SQ']
+        sq_strs_ = sq_.split('\n')[1:-1]
+        _sq = ''.join([s[:-2].strip() for s in sq_strs_])
+        sq = ''.join([s.strip() for s in _sq.split(' ')])
+        rec['sequence'] = ''.join([c for c in sq.upper() if c in ['A', 'C', 'G', 'U']])
+        return rec
+
+
+class _DatasetsMixin:
     """
         Must implement `_datasets_paths() -> tuple(train_filename, test_filename)`
     """
@@ -67,7 +188,7 @@ GRCh38_MAX_SUBSEQ_LEN = 30
 GRCh38_TOKENIZER_MAX_LEN = 50
 GRCh38_TRAIN_FRACTION = 0.9
 
-class GRCh38(DatasetsMixin):
+class _GRCh38(_DatasetsMixin):
     version = GRCh38_VERSION
     def __init__(self,
                *,
@@ -259,106 +380,13 @@ class GRCh38(DatasetsMixin):
         return subseqs
 
 
-MIRNA_VERSION = "0.0.1"
-MIRNA_DATASET_URL = "https://mirbase.org/ftp/CURRENT"
-MIRNA_DATASET_FILENAME = f"miRNA"
-class MiRNA(DatasetsMixin):
-    version = MIRNA_VERSION
-
-    def __init__(self, verbose=False, rm_tmp=True, ):
-        self.verbose = verbose
-        self.rm_tmp = rm_tmp
-    
-    def build(self,
-              root,
-              *,
-              train_fraction=0.9,):
-        fs = fsspec.filesystem('http')
-
-        remote_dat = MIRNA_DATASET_URL + '/' + f'{MIRNA_DATASET_FILENAME}.dat.gz'
-        local_dat = os.path.join(root, f'{MIRNA_DATASET_FILENAME}.dat.gz')
-        if not os.path.isfile(local_dat):
-            if self.verbose:
-                print(f"Downloading {remote_dat} to {local_dat}")
-            fs.get(remote_dat, local_dat, callback=TqdmCallback())
-        if self.verbose:
-            print(f"Parsing local copy {local_dat}")
-        with gzip.open(local_dat, 'r') as datfile:
-            datstr = datfile.read().decode()
-            frame = self._build_frame(datstr)
-
-        train_path, test_path = self._dataset_paths(root)
-
-        train_dataset = Dataset.from_pandas(frame.iloc[:int(train_fraction*len(frame))], split='train')
-        if self.verbose:
-            print(f"Built train dataset from dataframe with train_fraction {train_fraction}")
-        test_dataset = Dataset.from_pandas(frame.iloc[int(train_fraction*len(frame)):], split='test')
-        if self.verbose:
-            print(f"Built test dataset from dataframe with train_fraction {train_fraction}")
-        pq.write_table(train_dataset.data.table, train_path)
-        if self.verbose:
-            print(f"Wrote train dataset to {train_path}")
-        pq.write_table(test_dataset.data.table, test_path)
-        if self.verbose:
-            print(f"Wrote test dataset to {test_path}")
-    
-    
-    @staticmethod
-    def _dataset_paths(root=None):
-        train_path = os.path.join(root, f"{MIRNA_DATASET_FILENAME}.train.parquet",) if root is not None else f"{MIRNA_DATASET_FILENAME}.train.parquet"
-        test_path = os.path.join(root, f"{MIRNA_DATASET_FILENAME}.test.parquet",) if root is not None else f"{MIRNA_DATASET_FILENAME}.test.parquet"
-        return train_path, test_path
-
-    def _build_frame(self, mdstr):
-        recs = MiRNA._parse_records(mdstr)
-        f = pd.DataFrame.from_records(recs)
-        frame = f.sort_values('ID').reset_index(drop=True)
-        if self.verbose:
-            print(f"Built dataframe")
-        return frame
-
-    @staticmethod     
-    def _parse_records(mdstr):
-        _mdstrs = mdstr.split('\nID')
-        mdstrs = [f"ID{s}" for s in _mdstrs]
-        _prerecs = [MiRNA._parse_prerecord(s) for s in mdstrs]
-        prerecs = [pr for pr in _prerecs if pr['DE'].find('sapiens') != -1]
-        recs = [MiRNA._prerecord_to_record(pr) for pr in prerecs]
-        return recs
-
-    @staticmethod
-    def _parse_prerecord(recstr):
-        sqstart = recstr.find('SQ')+2
-        sqend = recstr.find('//')
-        sq = recstr[sqstart:sqend]
-        recstrs = recstr.split('\n')
-        rec_ = {s[:2]: s[3:] for s in recstrs}
-        _rec = {k: v.strip() for k, v in rec_.items() if k in ['ID', 'AC', 'DE']}
-        _rec['SQ'] = sq
-        return _rec
-
-    @staticmethod
-    def _prerecord_to_record(prerec):
-        rec = {}
-        _id = prerec['ID'].split(' ')[0]
-        rec['ID'] = _id
-        _ac = prerec['AC']
-        rec['Accession'] = _ac[:-1] if _ac[-1] == ';' else _ac
-        sq_ = prerec['SQ']
-        sq_strs_ = sq_.split('\n')[1:-1]
-        _sq = ''.join([s[:-2].strip() for s in sq_strs_])
-        sq = ''.join([s.strip() for s in _sq.split(' ')])
-        rec['sequence'] = ''.join([c for c in sq.upper() if c in ['A', 'C', 'G', 'U']])
-        return rec
-
-
 TOKENIZER_VERSION = '0.0.1'
 TOKENIZER_TRAINER_CHUNK_SIZE = 200
 TOKENIZER_TRAINER_VOCAB_SIZE = 100
 TOKENIZER_FILENAME = 'tokenizer'
 TOKENIZER_MAX_LEN = 50
 
-class Tokenizer:
+class _Tokenizer:
     version = TOKENIZER_VERSION
 
     def __init__(self, verbose=False):
@@ -430,7 +458,7 @@ class Tokenizer:
 TOKENIZED_DATASET_VERSION = '0.0.1'
 TOKENIZED_DATASET_MAX_LEN = 10
 TOKENIZED_DATASET_NUM_PROC = 24
-class TokenizedDatasets(DatasetsMixin):
+class _TokenizedDatasets(_DatasetsMixin):
     def __init__(self, verbose=False, num_proc=TOKENIZED_DATASET_NUM_PROC):
         self.verbose = verbose
         self.num_proc = num_proc
