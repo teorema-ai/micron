@@ -1,6 +1,9 @@
 biopython==1.81
+fasttext==0.9.2
 fsspec==2023.1.0
 gunzip==0.1.10
 jupyterlab_limit_output==1.0.0
+matplotlib==3.6.2
+plotly==5.13.1
 pyckmeans==0.9.4
-
+umap-learn==0.5.3

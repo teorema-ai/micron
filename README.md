@@ -1,5 +1,5 @@
 # micron
-LLM for miRNA space learning.
+Models for miRNA space learning.
 
 # SETUP
 * micron
@@ -11,7 +11,18 @@ LLM for miRNA space learning.
     - prod: #TODO
 
 # DATASETS
-* MiRNA: for tokenization and finetuning
-    >...
+* MiRNA: sequences
 * MiRCo: miR expression counts
-    >...
+
+# LITERATURE
+## FastText
+* "Distributed Representations of Words and Phrases and their Compositionality", 
+* https://fasttext.cc/docs/en/references.html
+### Docs
+* https://github.com/facebookresearch/fastText/blob/master/README.md
+* https://fasttext.cc/docs/en/python-module.html
+
+
+## RBM
+* "Discovering binary codes for documents by learning deep generative models", Geoffrey Hinton, Ruslan Salakhutdinov: https://pubmed.ncbi.nlm.nih.gov/25164175/
+
