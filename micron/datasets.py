@@ -7,7 +7,7 @@ import pickle
 from sklearn.cluster import KMeans
 import tarfile
 import tempfile
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
 import fsspec
 from fsspec.callbacks import TqdmCallback
@@ -23,6 +23,13 @@ from micron.cclustering import ZSConsensusClustering
 
 
 class Dataset:
+
+    @staticmethod
+    def display_umap(frame, *, color=None):
+        _umap = umap.UMAP()
+        _udata = _umap.fit_transform(frame.fillna(0.0))
+        plt.scatter(_udata[:, 0], _udata[:, 1], c=color)
+
     def print_verbose(self, s):
         if self.verbose:
             print(f">>> {self.__class__.__qualname__}: {s}")
@@ -59,6 +66,19 @@ class miRCoHN(Dataset):
     _SRC_URL = "https://gdac.broadinstitute.org/runs/stddata__2016_01_28/data/HNSC/20160128/"
     _SRC_TAR_DIRNAME = "gdac.broadinstitute.org_HNSC.miRseq_Mature_Preprocess.Level_3.2016012800.0.0"
     _SRC_DAT_FILENAME = "HNSC.miRseq_mature_RPM_log2.txt"
+
+    DOWNREGULATED_SEQ_PATTERNS = dict(
+        epithelial = list(set(['miR-150', 'miR-125b', 'miR-195', 'miR-127', 'miR-342', 'miR-361',
+                                  'miR-195', 'miR-125b', 'miR-150', 'miR-149', 'miR-342'
+               
+        ])),
+        stromal = list(set(['miR-210', 'miR-20a', 'miR-92a', 'miR-20b', 'miR-17', 'miR-200c', 'miR-200b', 
+                                   'miR-200a', 'miR-425', 'miR-18a', 'miR-183', 'miR-224', 'miR-181d', 'miR-221', 'miR-93', 'miR-106b', 
+                                   'miR-194', 'miR-660',
+                                   'miR-25', 'miR-106b', 'miR-93', 'miR-92a', 'miR-17', 'miR-20a', 'miR-210', 'miR-200a', 'miR-200c', 
+                                   'miR-200b', 'miR-194'
+        ]))
+    )
     
     def display(
             self,
@@ -66,10 +86,77 @@ class miRCoHN(Dataset):
             *, 
             filesystem: fsspec.AbstractFileSystem = fsspec.filesystem("file"),
     ):
-        cof = self.read(roots, scope=scope, filesystem=filesystem)
+        cof = self.read(roots, filesystem=filesystem)
+        self.display_umap(cof)
+        """
         ufit = umap.UMAP()
         ucof = ufit.fit_transform(cof.fillna(0.0))
         plt.scatter(ucof[:, 0], ucof[:, 1])
+        """
+
+    @staticmethod
+    def downregulated_seq_pattern(tissue_type):
+        return miRCoHN.DOWNREGULATED_SEQ_PATTERNS[tissue_type]
+
+    @staticmethod
+    def normalized_counts(counts:             pd.DataFrame, 
+                         *, 
+                         ordering:           Optional[List[int]] = None, 
+                         seq_patterns:       Optional[List[str]] = None, 
+                         seq_mad_threshold:  Optional[float] = None,
+                         remove_controls:    bool = True,
+                         center_at_controls: bool = False,
+    ) -> pd.DataFrame:
+        """
+            Inputs:
+                counts:              miR expression counts with one count profile record per row; 
+                                       columns are labeled by miR sequences
+                ordering:            permutation of rows to use for display
+                seq_patterns:        substrigs found in sequences to display; 
+                                       for example, sequence patters for miR known to be downregulated
+                                       in certain tissues
+                seq_mad_threshold: Maximal Absolute Deviation threshold: keep only the sequences with MAD > threshold
+                remove_controls:     remove records from normal (healthy) tissue
+                center_at_controls:  remove mean counts taken over control records
+            Ouput:
+                ncounts: counts reordered using 'ordering', restricted to columns satisfying seq_patterns, with MAD > seq_mad_threshold;
+                         if control_records are provided, counts are centered around the mean counts of control_records;
+                         any 'counts' records found among 'control_records' are removed
+
+        """
+        def seq_matches_patterns(seq, seq_patterns): 
+            for pattern in seq_patterns:
+                if seq.find(pattern) != -1:
+                    return True
+            return False
+
+        def filter_seq_patterns(counts):
+            #>...
+            ...
+
+        def filter_seq_mad(counts):
+            if seq_mad_threshold is None:
+                return counts
+            mads = (counts - counts.mean()).abs().mean()
+            madf = pd.DataFrame({'mad': mads})
+            madcuts = pd.qcut(madf.mad, 100, labels=False, duplicates='drop')
+            madcounts = counts[madcuts[madcuts > seq_mad_threshold].index]
+            return madcounts
+        
+        control_mask = miRCoHN.control_mask(_counts)
+        controls = counts[control_mask]
+        
+        if remove_controls:
+            _counts = _counts[~control_mask]
+
+        if center_at_controls:
+            cm = controls.mean(axis=0)
+            _counts = _counts - cm
+    
+    @staticmethod
+    def control_mask(counts):
+        controls = pd.Series(counts.index, index=counts.index).apply(lambda _: _.split('-')[3].startswith('11'))
+        return controls
 
     def build(self, 
              roots: Optional[Dict[str, str]] = None,
@@ -183,7 +270,7 @@ class miRCoHN(Dataset):
 
         #controls
         topic = 'controls'
-        controls = pd.Series(logcounts_frame.index, index=logcounts_frame.index).apply(lambda _: _.split('-')[3].startswith('11'))
+        controls = pd.Series(logcounts_frame.index, index=logcounts_frame.index).apply(self.rec_is_control)#(lambda _: _.split('-')[3].startswith('11'))
         controls.name = 'controls'
         topic_frame = controlsf = pd.DataFrame({'is_control': controls})
 
@@ -196,6 +283,7 @@ class miRCoHN(Dataset):
 
         #downregulated
         topic = 'downregulated_mirna_infixes'
+        """
         epithelial_downregulated_infixes = set(['miR-150', 'miR-125b', 'miR-195', 'miR-127', 'miR-342', 'miR-361',
                                   'miR-195', 'miR-125b', 'miR-150', 'miR-149', 'miR-342'
                
@@ -206,6 +294,9 @@ class miRCoHN(Dataset):
                                    'miR-25', 'miR-106b', 'miR-93', 'miR-92a', 'miR-17', 'miR-20a', 'miR-210', 'miR-200a', 'miR-200c', 
                                    'miR-200b', 'miR-194'
         ])
+        """
+        epithelial_downregulated_infixes = self.DOWNREGULATED_SEQ_PATTERNS['epithelial']
+        stromal_downregulated_infixes = self.DOWNREGULATED_SEQ_PATTERNS['stromal']
         topic_frame = downregulated_frame = pd.DataFrame.from_records([{'epithelial': ','.join(list(epithelial_downregulated_infixes)), 
                                                                         'stromal': ','.join(list(stromal_downregulated_infixes))}])
         topic_tgt_root = roots[topic] if roots is not None else os.getcwd()
@@ -618,14 +709,3 @@ class ZSCC(Dataset):
             if self.verbose:
                 print(f"Read zscc clusters from {clusters_path}")
         return _
-
-
-        
-
-
-
-
-
-
-
-    
