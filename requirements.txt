@@ -4,6 +4,10 @@ fsspec==2023.1.0
 gunzip==0.1.10
 jupyterlab_limit_output==1.0.0
 matplotlib==3.6.2
+kipoiseq==0.5.2
 plotly==5.13.1
 pyckmeans==0.9.4
+seaborn==0.13.0
+tensorflow==2.15.0
+tensorflow-hub==0.15.0
 umap-learn==0.5.3

@@ -15,7 +15,7 @@ def get_requirements():
 
 setuptools.setup(
     name="micron",
-    version="0.0.1",
+    version="0.2.0",
     author="Dmitry Karpeyev",
     author_email="dmitry.karpeyev@gmail.com",
     description="micro RNA LLM package",

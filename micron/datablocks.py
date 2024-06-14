@@ -1,6 +1,8 @@
-import bisect
 from dataclasses import dataclass
+import functools
 import importlib
+import inspect
+from io import StringIO
 from itertools import combinations
 import gzip
 import os
@@ -17,6 +19,10 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
+from Bio import Entrez
+from Bio import SeqIO
+Entrez.email = "fight.cancer@quantum.bio.tech"
+
 import fasttext
 import matplotlib.pyplot as plt
 import plotly.express as px
@@ -26,21 +32,64 @@ from micron.cclustering import ZSConsensusClustering
 
 
 class Datablock:
+    REVISION = '0.0.1'
+    @dataclass
+    class SCOPE:
+        pass
+
     @staticmethod
-    def display_umap(frame, *, color=None):
-        _umap = umap.UMAP()
+    def display_umap(frame, *, color=None, seed=42):
+        _umap = umap.UMAP(random_state=seed)
         _udata = _umap.fit_transform(frame.fillna(0.0))
         plt.scatter(_udata[:, 0], _udata[:, 1], c=color)
 
-    def print_verbose(self, s):
-        if self.verbose:
-            print(f">>> {self.__class__.__qualname__}: {s}")
+    def __init__(self, 
+                 roots=None, 
+                 filesystem:fsspec.AbstractFileSystem = fsspec.filesystem("file"), 
+                 scope=None,
+                 *, 
+                 verbose=False, 
+                 debug=False, 
+                 rm_tmp=True, ):
+        self.scope = scope
+        if self.scope is None:
+            self.scope = self.SCOPE()
+        self.roots = roots
+        self.filesystem = filesystem
+        self.verbose = verbose
+        self.debug = debug
+        self.rm_tmp = rm_tmp
+        if hasattr(self, '__setup__'):
+            self.__setup__()
 
-    def print_debug(self, s):
-        if self.debug:
-            print(f"DEBUG: >>> {self.__class__.__qualname__}: {s}")
+    def valid(self, topic=None):
+        if hasattr(self, 'TOPICS'):
+            path = self.path(topic)
+        else:
+            path = self.path()
+        if path is None:
+            return True # by default
+        self.print_debug(f"{self.__class__}: valid(): checking path {path} to validate topic {repr(topic)}")
+        _ = self.filesystem.exists(path)
+        self.print_debug(f"{self.__class__}: valid(): path {path} exists: {_}")
+        return _            
 
-    def path(self, roots, filesystem, topic=None):
+    def built(self):
+        built = True
+        if hasattr(self, 'TOPICS'):
+            for topic in self.TOPICS:
+                if not self.valid(topic):
+                    self.print_verbose(f"Topic {topic} not built")
+                    built = False
+                    break
+        else:
+            if not self.valid():
+                built = False
+        return built
+
+    def path(self, topic=None):
+        roots = self.roots
+        filesystem = self.filesystem
         if topic is not None:
             if filesystem.protocol == 'file':
                 if roots is None:
@@ -63,35 +112,61 @@ class Datablock:
                 path = roots + "/" + self.FILENAME
         return path
 
-    #TODO: factor through 'valid()'
-    def built(self):
-        built = True
-        if hasattr(self, 'TOPICS'):
-            for topic in self.TOPICS:
-                path = self.path(self.roots, self.filesystem, topic)
-                if not self.filesystem.exists(path):
-                    self.print_verbose(f"Topic '{topic}' not built at path {path}")
-                    built = False
-                    break
-        else:
-            path = self.path(self.roots, self.filesystem)
-            built = self.filesystem.exists(path)
-        return built
+    def print_verbose(self, s):
+        if self.verbose:
+            print(f">>> {self.__class__.__qualname__}: {s}")
 
-    def __init__(self, 
-                 roots=None, 
-                 filesystem:fsspec.AbstractFileSystem = fsspec.filesystem("file"), 
-                 scope=None,
-                 *, 
-                 verbose=False, 
-                 debug=False, 
-                 rm_tmp=True, ):
-        self.scope = scope
-        self.roots = roots
-        self.filesystem = filesystem
-        self.verbose = verbose
-        self.debug = debug
-        self.rm_tmp = rm_tmp
+    def print_debug(self, s):
+        if self.debug:
+            print(f"DEBUG: >>> {self.__class__.__qualname__}: {s}")
+
+
+class miRLogCoHN(Datablock):
+    """
+        Data for the clustering HNSC study described in from https://www.ncbi.nlm.nih.gov/pmc/articles/PMC7854517/.
+        TODO: do not save 'pivots' or 'downregulated_mirna_infixes' to a file, return them from code instead?
+    """
+    REVISION = "0.1.1"
+    FILENAME = "mircohn_rpm_log2.parquet"
+
+    _SRC_URL = "https://gdac.broadinstitute.org/runs/stddata__2016_01_28/data/HNSC/20160128/"
+    _SRC_TAR_DIRNAME = "gdac.broadinstitute.org_HNSC.miRseq_Mature_Preprocess.Level_3.2016012800.0.0"
+    _SRC_DAT_FILENAME = "HNSC.miRseq_mature_RPM_log2.txt"
+
+    def read(self):
+        self.print_verbose(f"Reading '{self.__class__.__qualname__}'")
+        topic_tgt_path = self.path()
+        topic_frame = pd.read_parquet(topic_tgt_path, storage_options=self.filesystem.storage_options)
+        return topic_frame
+    
+    def build(self):
+        """
+            Generate a pandas dataframe of TCGA HNSC mature MiRNA sequence samples.
+        """
+        if self.built():
+            self.print_verbose("Already built.  Done.")
+        else:
+            self.print_verbose("Building ...")
+            # logcounts
+            topic_tgt_path = self.path()
+            fs = fsspec.filesystem('http')
+            with tempfile.TemporaryDirectory() as tmpdir:
+                remote_tarpath = self._SRC_URL + '/' + self._SRC_TAR_DIRNAME + ".tar.gz"
+                local_tarpath = os.path.join(tmpdir, self._SRC_TAR_DIRNAME) + ".tar.gz"
+                self.print_verbose(f"Downloading {remote_tarpath} to {local_tarpath}")
+                fs.get(remote_tarpath, local_tarpath, callback=TqdmCallback())
+                assert os.path.isfile(local_tarpath)
+                self.print_verbose(f"Trying to parse local copy {local_tarpath}")
+                _tardir = os.path.join(tmpdir, self._SRC_TAR_DIRNAME)
+                with tarfile.open(local_tarpath, 'r') as _tarfile:
+                    self.print_verbose(f"Extracting {local_tarpath} to {_tardir}")
+                    _tarfile.extractall(tmpdir)
+                self.print_debug(f"Extracted dir: {os.listdir(_tardir)}")
+                logcounts_src_path = os.path.join(_tardir, self._SRC_DAT_FILENAME)
+                topic_frame = logcounts_frame = pd.read_csv(logcounts_src_path, sep='\t', header=0, index_col=0).transpose()
+
+                topic_frame.to_parquet(topic_tgt_path, storage_options=self.filesystem.storage_options)
+                self.print_verbose(f"Wrote dataframe to {topic_tgt_path}")
 
 
 class miRCoHN(Datablock):
@@ -99,19 +174,21 @@ class miRCoHN(Datablock):
         Data for the clustering HNSC study described in from https://www.ncbi.nlm.nih.gov/pmc/articles/PMC7854517/.
         TODO: do not save 'pivots' or 'downregulated_mirna_infixes' to a file, return them from code instead?
     """
-    VERSION = "0.11.3"
-    
-    TOPICS = {'logcounts': f"mircohn_rpm_log2.parquet",
-                'pivots': f"mircohn_pivots.parquet",
-                'logcontrols': f"mircohn_controls.parquet",
-                'downregulated_mirna_infixes': f"mircohn_downregulated_mirna_infixes.parquet"
-    }
+    REVISION = "1.2.1"
 
     @dataclass
     class SCOPE:
-        pass
+        logcounts: pd.DataFrame 
+    
+    TOPICS = {'logcounts': f"mircohn_rpm_log2.parquet",
+              'counts': f"mircohn_rpm.parquet",
+              'logcontrols': f"mircohn_logcontrols.parquet",
+              'controls': f"mircohn_ontrols.parquet",
+              'seq_patterns': f"seq_patterns.parquet",
+              'pivots': f"mircohn_pivots.parquet",
+    }
 
-    DOWNREGULATED_SEQ_PATTERNS = dict(
+    SEQ_PATTERNS = dict(
         epithelial = list(set(['miR-150', 'miR-125b', 'miR-195', 'miR-127', 'miR-342', 'miR-361',
                                   'miR-195', 'miR-125b', 'miR-150', 'miR-149', 'miR-342'
                
@@ -183,10 +260,6 @@ class miRCoHN(Datablock):
     def control_records_mask(counts):
         controls = pd.Series(counts.index, index=counts.index).apply(lambda _: _.split('-')[3].startswith('11'))
         return controls
-
-    _SRC_URL = "https://gdac.broadinstitute.org/runs/stddata__2016_01_28/data/HNSC/20160128/"
-    _SRC_TAR_DIRNAME = "gdac.broadinstitute.org_HNSC.miRseq_Mature_Preprocess.Level_3.2016012800.0.0"
-    _SRC_DAT_FILENAME = "HNSC.miRseq_mature_RPM_log2.txt"
     
     def display(
             self,
@@ -209,7 +282,7 @@ class miRCoHN(Datablock):
     @staticmethod
     def filter_columns_by_patterns(frame, col_patterns):
         if col_patterns is not None:
-            fcols = [col for col in frame.columns if miRCoHN.seq_matches_patterns(col, col_patterns)]
+            fcols = [col for col in frame.columns.get_level_values(0) if miRCoHN.seq_matches_patterns(col, col_patterns)]
             fframe = frame[fcols]
         else:
             fframe = frame
@@ -231,6 +304,11 @@ class miRCoHN(Datablock):
         cm = controls.mean(axis=0)
         cframe = frame - cm
         return cframe
+    
+    @staticmethod
+    def expcounts(logcounts):
+        counts = np.exp(logcounts.copy()*np.log(2))
+        return counts
     
     @staticmethod
     def display_heatmap(counts:             pd.DataFrame, 
@@ -266,9 +344,7 @@ class miRCoHN(Datablock):
         """
             Generate a pandas dataframe of TCGA HNSC mature MiRNA sequence samples.
         """
-        roots = self.roots
-        filesystem = self.filesystem
-        framepaths = {topic: self.path(roots, filesystem, topic) for topic in self.TOPICS}
+        framepaths = {topic: self.path(topic) for topic in self.TOPICS}
         if self.built():
             self.print_verbose("All topics built already.  Done.")
         else:
@@ -276,56 +352,55 @@ class miRCoHN(Datablock):
             # logcounts
             topic = 'logcounts'
             topic_tgt_path = framepaths[topic]
-            fs = fsspec.filesystem('http')
-            with tempfile.TemporaryDirectory() as tmpdir:
-                remote_tarpath = self._SRC_URL + '/' + self._SRC_TAR_DIRNAME + ".tar.gz"
-                local_tarpath = os.path.join(tmpdir, self._SRC_TAR_DIRNAME) + ".tar.gz"
-                self.print_verbose(f"Downloading {remote_tarpath} to {local_tarpath}")
-                fs.get(remote_tarpath, local_tarpath, callback=TqdmCallback())
-                assert os.path.isfile(local_tarpath)
-                self.print_verbose(f"Trying to parse local copy {local_tarpath}")
-                _tardir = os.path.join(tmpdir, self._SRC_TAR_DIRNAME)
-                with tarfile.open(local_tarpath, 'r') as _tarfile:
-                    self.print_verbose(f"Extracting {local_tarpath} to {_tardir}")
-                    _tarfile.extractall(tmpdir)
-                self.print_debug(f"Extracted dir: {os.listdir(_tardir)}")
-                logcounts_src_path = os.path.join(_tardir, self._SRC_DAT_FILENAME)
-                logcounts_frame = pd.read_csv(logcounts_src_path, sep='\t', header=0, index_col=0).transpose()
-                logcontrols_mask = miRCoHN.control_records_mask(logcounts_frame)
-                topic_frame = _logcounts_frame = logcounts_frame[~logcontrols_mask]
+            _logcounts_frame = self.scope.logcounts
+            logcontrols_mask = miRCoHN.control_records_mask(_logcounts_frame)
+            topic_frame = logcounts_frame = _logcounts_frame[~logcontrols_mask]
 
-                coltuples = [tuple(c.split('|')) for c in _logcounts_frame.columns]
-                mindex = pd.MultiIndex.from_tuples(coltuples)
-                _logcounts_frame.columns = mindex
+            coltuples = [tuple(c.split('|')) for c in logcounts_frame.columns]
+            mindex = pd.MultiIndex.from_tuples(coltuples)
+            logcounts_frame.columns = mindex
+            topic_frame.to_parquet(topic_tgt_path, storage_options=self.filesystem.storage_options)
+            self.print_verbose(f"Wrote dataframe to {topic_tgt_path}")
 
-                topic_frame.to_parquet(topic_tgt_path, storage_options=filesystem.storage_options)
-                self.print_verbose(f"Wrote dataframe to {topic_tgt_path}")
+            # counts
+            topic = 'counts'
+            topic_frame = counts_frame = self.expcounts(logcounts_frame)
+            topic_tgt_path = framepaths[topic]
+            topic_frame.to_parquet(topic_tgt_path, storage_options=self.filesystem.storage_options)
+            self.print_verbose(f"Wrote dataframe to {topic_tgt_path}")
 
             # pivots
             topic = 'pivots'
             topic_tgt_path = framepaths[topic]
             topic_frame = pivots_frame = pd.DataFrame({'pivots': self.PIVOT_SEQS})
-            topic_frame.to_parquet(topic_tgt_path, storage_options=filesystem.storage_options)
+            topic_frame.to_parquet(topic_tgt_path, storage_options=self.filesystem.storage_options)
             self.print_verbose(f"Wrote dataframe to {topic_tgt_path}")
 
             #logcontrols
             topic = 'logcontrols'
             topic_tgt_path = framepaths[topic]
-            topic_frame = logcontrols_frame = logcounts_frame[logcontrols_mask]
+            topic_frame = logcontrols_frame = _logcounts_frame[logcontrols_mask]
             ccoltuples = [tuple(c.split('|')) for c in logcontrols_frame.columns]
             cmindex = pd.MultiIndex.from_tuples(ccoltuples)
             logcontrols_frame.columns = cmindex
-            topic_frame.to_parquet(topic_tgt_path, storage_options=filesystem.storage_options)
+            topic_frame.to_parquet(topic_tgt_path, storage_options=self.filesystem.storage_options)
+            self.print_verbose(f"Wrote dataframe to {topic_tgt_path}")
+
+            #controls
+            topic = 'controls'
+            topic_tgt_path = framepaths[topic]
+            topic_frame = controls_frame = self.expcounts(logcounts_frame)
+            topic_frame.to_parquet(topic_tgt_path, storage_options=self.filesystem.storage_options)
             self.print_verbose(f"Wrote dataframe to {topic_tgt_path}")
 
             #downregulated
-            topic = 'downregulated_mirna_infixes'
+            topic = 'seq_patterns'
             topic_tgt_path = framepaths[topic]
-            epithelial_downregulated_infixes = self.DOWNREGULATED_SEQ_PATTERNS['epithelial']
-            stromal_downregulated_infixes = self.DOWNREGULATED_SEQ_PATTERNS['stromal']
+            epithelial_downregulated_infixes = self.SEQ_PATTERNS['epithelial']
+            stromal_downregulated_infixes = self.SEQ_PATTERNS['stromal']
             topic_frame = downregulated_frame = pd.DataFrame.from_records([{'epithelial': ','.join(list(epithelial_downregulated_infixes)), 
                                                                             'stromal': ','.join(list(stromal_downregulated_infixes))}])
-            topic_frame.to_parquet(topic_tgt_path, storage_options=filesystem.storage_options)
+            topic_frame.to_parquet(topic_tgt_path, storage_options=self.filesystem.storage_options)
             self.print_verbose(f"Wrote dataframe to {topic_tgt_path}")
 
             self.print_verbose("... done")
@@ -333,13 +408,13 @@ class miRCoHN(Datablock):
     
     def read(self, topic,):
         self.print_verbose(f"Reading topic '{topic}'")
-        topic_tgt_path = self.path(self.roots, self.filesystem, topic)
+        topic_tgt_path = self.path(topic)
         topic_frame = pd.read_parquet(topic_tgt_path, storage_options=self.filesystem.storage_options)
         return topic_frame
 
 
 class miRNA(Datablock):
-    VERSION = "0.2.1"
+    REVISION = "0.3.1"
 
     @dataclass
     class SCOPE:
@@ -375,13 +450,13 @@ class miRNA(Datablock):
                     datstr = datfile.read()
                     frame = self._build_frame(datstr)
 
-            path = self.path(root, filesystem)
-            frame.to_parquet(path, storage_options=filesystem.storage_options)
+            path = self.path()
+            frame.to_parquet(path, storage_options=self.filesystem.storage_options)
             self.print_verbose(f"Wrote frame of len {len(frame)} to path")
             self.print_verbose("... done")
 
     def read(self):
-        path = self.path(self.roots, self.filesystem)
+        path = self.path()
         frame = pd.read_parquet(path, storage_options=self.filesystem.storage_options)
         return frame
     
@@ -431,10 +506,11 @@ class miRCoSeqs(Datablock):
     """
         Sequences sampled at count frequences
     """
-    VERSION = "1.2.0"
+    REVISION = "1.4.0"
     TOPICS = {'logcounts': f"miRLogCos.parquet",
                  'counts': f"miRCos.parquet",
                  'logcontrols': f"miRLogCtrls.parquet",
+                 'controls': f"miRCtrls.parquet",
                  'seqs': f"miRSeqs.parquet",
                  'samples': f"miRCoSeqs.txt",
                  'rec_sample_ranges': f"miRSampleRanges.parquet"
@@ -492,17 +568,17 @@ class miRCoSeqs(Datablock):
             jcols = [i for i in _seqf.index if i in _cof.columns]
 
             jcof = lift_jcols(_cof[jcols], coseq2co)
-            jcof_path = self.path(roots, filesystem, 'counts')
+            jcof_path = self.path('counts')
             jcof.to_parquet(jcof_path, storage_options=filesystem.storage_options)
             self.print_verbose(f"Wrote counts to {jcof_path}")
 
             jlogcof = lift_jcols(_logcof[jcols], coseq2co)
-            jlogcof_path = self.path(roots, filesystem, 'logcounts')
+            jlogcof_path = self.path('logcounts')
             jlogcof.to_parquet(jlogcof_path, storage_options=filesystem.storage_options)
             self.print_verbose(f"Wrote logcounts to {jlogcof_path}")
             
             jseqf = lift_jcols(_seqf.loc[jcols].transpose(), coseq2co).transpose()
-            jseqs_path = self.path(roots, filesystem, 'seqs')
+            jseqs_path = self.path('seqs')
             jseqf.to_parquet(jseqs_path, storage_options=filesystem.storage_options)
             self.print_verbose(f"Wrote sequences to {jseqs_path}")
 
@@ -512,9 +588,14 @@ class miRCoSeqs(Datablock):
             jseqlist = jseqs.tolist()
 
             jlogcontrols = scope.logcontrols[co2coseq.keys()]
-            jlogcontrols_path = self.path(roots, filesystem, 'logcontrols')
+            jlogcontrols_path = self.path('logcontrols')
             jlogcontrols.to_parquet(jlogcontrols_path, storage_options=filesystem.storage_options)
             self.print_verbose(f"Wrote logcontrols to {jlogcontrols_path}")
+
+            jcontrols = self.expcounts(scope.logcontrols[co2coseq.keys()])
+            jcontrols_path = self.path('controls')
+            jcontrols.to_parquet(jcontrols_path, storage_options=filesystem.storage_options)
+            self.print_verbose(f"Wrote controls to {jcontrols_path}")
 
             self.print_verbose(f"Generating samples using {scope.npasses} passes")
             rec_sample_ranges = {recidx: [] for recidx in jcofn.index}
@@ -539,7 +620,7 @@ class miRCoSeqs(Datablock):
                 self.print_verbose(f"Generated {n_pass_samples} in pass {_pass} for a total of {n_samples} so far")
             self.print_verbose(f"Generated {n_samples} samples")
 
-            samples_path = self.path(roots, filesystem, 'samples')
+            samples_path = self.path('samples')
             with filesystem.open(samples_path, 'w') as f:
                 self.print_verbose(f"Writing {n_samples} samples to {samples_path}")
                 for i, freq in sample_batches:
@@ -549,7 +630,7 @@ class miRCoSeqs(Datablock):
 
             rec_sample_ranges_frame = pd.DataFrame(rec_sample_ranges).transpose()
             rec_sample_ranges_frame.columns.name = 'pass'
-            rec_sample_ranges_path = self.path(roots, filesystem, 'rec_sample_ranges')
+            rec_sample_ranges_path = self.path('rec_sample_ranges')
             rec_sample_ranges_frame.to_parquet(rec_sample_ranges_path, storage_options=filesystem.storage_options)
             self.print_verbose(f"Wrote {len(rec_sample_ranges_frame)} to {rec_sample_ranges_path}")
         self.print_verbose("... done")
@@ -557,7 +638,7 @@ class miRCoSeqs(Datablock):
     def read(self, topic):
         roots = self.roots
         filesystem = self.filesystem
-        path = self.path(roots, filesystem, topic)
+        path = self.path(topic)
         if topic == 'samples':
             with filesystem.open(path, 'r') as f:
                 s = f.read()
@@ -583,7 +664,7 @@ class miRCoSeqs(Datablock):
 
 
 class ZSCC(Datablock):
-    VERSION = "0.6.1"
+    REVISION = "0.8.1"
     TOPICS = {
         'zscc': 'zscc.pkl',
         'clusters': 'clusters.parquet',
@@ -604,7 +685,7 @@ class ZSCC(Datablock):
         fillna: Optional[float] = None
 
     def build(self,):
-        roots = self.roots
+        scope = self.scope
         filesystem = self.filesystem
         if self.built():
             self.print_verbose(f"ZSCC already built")
@@ -621,7 +702,7 @@ class ZSCC(Datablock):
             self.print_verbose(f"Fitting zscc to data of size {len(data_frame)}")
             zscc.fit(data_frame.values)
 
-            zscc_path = self.path(roots, filesystem, 'zscc')
+            zscc_path = self.path('zscc')
             with filesystem.open(zscc_path, 'wb') as zsccfile:
                 pickle.dump(zscc, zsccfile)
             if self.verbose:
@@ -629,13 +710,13 @@ class ZSCC(Datablock):
 
             if self.verbose:
                 print(f"Assigning optimal clusters to data of len {len(data_frame)}")
-            clusters_path = self.path(roots, filesystem, 'clusters')
+            clusters_path = self.path('clusters')
             clusters = zscc.predict_data(data_frame.values)
             clusters_frame = pd.DataFrame({'clusters': clusters})
             clusters_frame.to_parquet(clusters_path, storage_options=filesystem.storage_options)
             self.print_verbose(f"Wrote zscc clusters to {clusters_path}")
 
-            ordering_path = self.path(roots, filesystem, 'ordering')
+            ordering_path = self.path('ordering')
             ordering = np.argsort(clusters)
             with filesystem.open(ordering_path, 'wb') as ordering_file:
                 pickle.dump(ordering, ordering_file)
@@ -646,20 +727,20 @@ class ZSCC(Datablock):
         roots = self.roots
         filesystem = self.filesystem
         if topic == 'zscc':
-            zscc_path = self.path(roots, filesystem, 'zscc')
+            zscc_path = self.path('zscc')
             with filesystem.open(zscc_path, 'rb') as zsccfile:
                 zscc = pickle.load(zsccfile)
                 _ = zscc
             if self.verbose:
                 print(f"Loaded zscc pickle from {zscc_path}")
         elif topic == 'clusters':
-            clusters_path = self.path(roots, filesystem, 'clusters')
+            clusters_path = self.path('clusters')
             clusters_frame = pd.read_parquet(clusters_path, storage_options=filesystem.storage_options)
             _ = clusters_frame
             if self.verbose:
                 print(f"Read zscc clusters from {clusters_path}")
         elif topic == 'ordering':
-            ordering_path = self.path(roots, filesystem, 'ordering')
+            ordering_path = self.path('ordering')
             with filesystem.open(ordering_path, 'rb') as ordering_file:
                 _ = pickle.load(ordering_file)
             if self.verbose:
@@ -670,7 +751,7 @@ class ZSCC(Datablock):
 
 
 class FastText(Datablock):
-    VERSION = "0.6.1"
+    REVISION = "0.8.1"
     
     @dataclass
     class SCOPE:
@@ -709,7 +790,7 @@ class FastText(Datablock):
             self.print_verbose(f"'{scope.model}' already built")
         else:
             self.print_verbose(f"Building '{scope.model}' ...")
-            path = self.path(root, filesystem)
+            path = self.path()
             if not filesystem.exists(path):
                 samples_files = filesystem.ls(scope.samples_path)
                 assert len(samples_files) == 1
@@ -719,6 +800,386 @@ class FastText(Datablock):
             self.print_verbose("... done")
 
     def read(self,):
-        path = self.path(self.roots, self.filesystem)
+        path = self.path()
         model = fasttext.load_model(path)
         return model
+
+
+class HNSCCProfiles(Datablock):
+    """
+        HNSCC records of expression counts (miR, mR) and HPV status
+    """
+    REVISION = '0.1.1'
+    TOPICS = ['mir_co',
+              'mr_co',
+              'hpv_status',
+              'full',
+              'mr_co_gene_ids',
+              ]
+
+    @dataclass
+    class SCOPE:
+        srcpath: str = None
+
+    def __setup__(self):
+        if self.scope.srcpath is None:
+            filepath = inspect.getmodule(self.__class__).__file__
+            # .../quantum/micron/micron/datablocks.py
+            qroot= os.path.dirname(os.path.dirname(os.path.dirname(filepath)))
+
+            self.srcpath = qroot + '/' + '/'.join(('data', 'HNSCC', 'full'))
+            
+            if self.filesystem.protocol != "file":
+                raise 
+        else:
+            self.srcpath = self.scope.srcpath
+
+    @functools.lru_cache(maxsize=None)
+    def read(self, topic):
+        if topic not in self.TOPICS:
+            raise ValueError(f"Topic '{topic}' not among known topics {self.TOPICS}")
+        
+        if topic == 'mr_co':
+            filepath = f"{self.srcpath}/tcga_hnscc_all_sig_mrna_full.csv"
+            _frame = pd.read_csv(filepath, index_col=0, storage_options=self.filesystem.storage_options)
+            columns = [c for c in _frame.columns if c.find('|') != -1 and c.split('|')[0] != '?']
+            frame = _frame[columns]
+        elif topic == 'mir_co':
+            filepath = f"{self.srcpath}/tcga_hnscc_all_mirna_full.csv"
+            frame = pd.read_csv(filepath, index_col=0, storage_options=self.filesystem.storage_options)
+        elif topic == 'hpv_status':
+            filepath = f"{self.srcpath}/combined_full.csv"
+            _frame = pd.read_csv(filepath, index_col=0, storage_options=self.filesystem.storage_options)
+            frame = _frame[['HPV_status']]
+        elif topic == 'mr_co_gene_ids':
+            coframe = self.read("mr_co")
+            gene_ids = [c.split('|')[1] for c in coframe.columns]
+            self.print_debug(f"DEBUG: >>>>>>>>>>>> HNSCCProfiles: gene_ids: len(gene_ids): {len(gene_ids)}")
+            frame = pd.DataFrame({'gene_ids': gene_ids}, index=gene_ids).transpose()
+        elif topic == 'full':
+            filepath = f"{self.srcpath}/combined_full.csv"
+            frame = pd.read_csv(filepath, index_col=0, storage_options=self.filesystem.storage_options)
+        return frame
+    
+    def valid(self, topic):
+        return True
+
+
+class HNSCCmRCoHPV(Datablock):
+    """
+        HNSCC: unique mRNA count records that have a matching HPV status
+    """
+    REVISION = '0.1.1'
+    TOPICS = {
+              'mrco': 'mRCo.parquet',
+              'hpv': 'hpv.parquet',
+    }
+
+    @dataclass
+    class SCOPE:
+        mr_co: pd.DataFrame
+        hpv_status: pd.DataFrame
+
+    def _write_dataframe(self, topic, frame):
+        path = self.path(topic)
+        frame.to_parquet(path, storage_options=self.filesystem.storage_options)
+        self.print_verbose(f"Wrote {self.__class__.__qualname__} '{topic}' frame with {len(frame)} rows to {path}")
+
+    def read(self, topic):
+        path = self.path(topic)
+        frame = pd.read_parquet(path, storage_options=self.filesystem.storage_options)
+        self.print_verbose(f"Read {self.__class__.__qualname__} '{topic}' frame with {len(frame)} rows from {path}")
+        return frame
+
+    def build(self):
+        if self.built():
+            self.print_verbose(f"{self.__class__.__name__} already built")
+        else:
+            self.print_verbose(f"Building {self.__class__.__name__} ...")
+            _hmrco = self.scope.mr_co
+            _hmrco.index.name = 'patient_id' 
+            _hmrco_unique = _hmrco.groupby('patient_id').std().isnull().all(axis=1) # patients with no duplicates
+            hmrco = _hmrco[_hmrco_unique]
+            
+            hs = self.scope.hpv_status.groupby('patient_id').first()
+            jhmrcos = hmrco.join(hs, how='inner', validate="1:1")
+
+            jhmrco = jhmrcos[[c for c in jhmrcos.columns if c != 'HPV_status']]
+            jhs = jhmrcos[['HPV_status']].rename(columns={'HPV_status': 'hpv'})
+
+            #hpv
+            self._write_dataframe('hpv', jhs)
+            
+            #mrco
+            self._write_dataframe('mrco', jhmrco)
+
+            self.print_verbose("... done")
+
+#TODO: FIX
+'''
+class mRSeqs(Datablock):
+    """
+        mRNA sequences for a given set of gene_ids.
+        gene_id: gene_symbol|ncbi_id
+        
+    """
+
+    REVISION = '0.2.1'
+    TYPE = pd.DataFrame
+    SCHEMA = {"gene_id": str, "seq": str}
+
+    class RANGE(tuple):
+        lo: int
+        hi: Optional[int] = None
+
+        def __post_init__(self):
+            if self.high is None:
+                self.high = self.lo + 1
+
+    @dataclass
+    class SCOPE:
+        gene_ids_frame: pd.DataFrame
+        gene_ids_bucket: RANGE
+
+    def path(self, gene_id):
+        sym, ncbi = gene_id.split('|')
+        filename = f"mrseqs.{sym}.{ncbi}"
+        if self.filesystem.protocol == 'file':
+            if self.roots is None:
+                path = os.join(os.getcwd(), filename)
+            else:
+                path_ = self.roots
+                os.makedirs(path_, exist_ok=True)
+                path = os.path.join(path_, filename)
+        else:
+            path = self.roots + "/" + filename
+        return path
+    
+    def gene_ids(self):
+        return list(self.scope.gene_id_cols.columns)
+
+    def gene_ids_bucket(self):
+        lo, hi = self.scope.gene_ids_bucket.lo, self.scope.gene_ids_bucket.hi
+        bucket = self.gene_ids[lo:hi]
+        return bucket
+
+    def paths(self):
+        paths = {}
+        for gene_id in self.gene_ids_bucket:
+            path = self.path(gene_id)
+            if path is not None:
+                paths[gene_id] = path
+        return _
+
+    def build(self):
+        # gene_ids are of the form: "{gene_symbol}|{ncbi_id}"; we need gene_symbols.
+        # for example, 'ABCD2|225' -> 'ABCD2'
+        # ncbi_id may also be known as Entrez ID or simply Entrez.
+        self.print_verbose(f"{self.__class__.__name__}: starting build of batch of bucket {self.sccope.bucket} " + 
+                           f"with gene_ids {len(self.gene_ids)} gene_ids ...")
+
+        #TODO: 1. Store all sequences from the bucket in the same file. 
+        #      2. Try all ids in the request first.
+        #      3. Fall back on individual requests in case of failure
+        paths = self.paths()
+        failed_gene_ids = []
+        for gene_id, path in paths.items():
+            try:
+                seq = self._fetch_mrna_sequences([gene_id])
+                frame = pd.DataFrame({k: str(v) for k, v in seqs.items()}, index=['seq']).transpose()
+                frame.to_parquet(path, storage_options=self.filesystem.storage_options)
+                self.print_verbose(f"{self.__class__.__name__}: wrote frame of len {len(frame)} to {path}")
+            except:
+                failed_gene_ids.append(gene_id)
+        if len(failed_gene_ids) == 0:
+            self.print_verbose(f"{self.__class__.__name__}: build complete")
+        else:
+            raise ValueError(f"Failed gene_ids: {failed_gene_ids}")
+
+    def read(self):
+        paths = self.paths()
+        frame = pd.read_parquet(list(paths.values()), storage_options=self.filesystem.storage_options)
+        self.print_verbose(f"{self.__class__.__name__}: read frame of len {len(frame)} from {len(paths)} paths")
+        return frame
+    
+    def valid(self):
+        metric = self.metric()
+        valid = metric is not None
+        return valie
+        
+    def metric(self):
+        try:
+            frame = self.read()
+            _ = len(frame) if frame is not None else 0
+        except:
+            _ = None
+        return _
+
+    @staticmethod
+    def _fetch_mrna_sequences(gene_ids):
+        """
+        Fetch mRNA sequences for given gene symbols from NCBI.
+
+        :param gene_symbols: A list of gene symbols.
+        :return: A dictionary with gene symbols as keys and mRNA sequences as values.
+        """
+
+        gene_symbols = [c.split('|')[0] for c in gene_ids]
+        sequences = {}
+        for i, symbol in enumerate(gene_symbols):
+            # Search for the gene symbol in the nucleotide database to get the sequence IDs
+            handle = Entrez.esearch(db="nucleotide", term=f"{symbol}[Gene Name] AND mRNA[Filter]", retmax=10)
+            record = Entrez.read(handle)
+            handle.close()
+
+            # Fetch the sequences for each ID found
+            for seq_id in record["IdList"]:
+                handle = Entrez.efetch(db="nucleotide", id=seq_id, rettype="fasta", retmode="text")
+                seq_record = SeqIO.read(handle, "fasta")
+                handle.close()
+
+                # Store the sequence
+                sequences[gene_ids[i]] = seq_record.seq
+
+        return sequences
+'''
+    
+class GRCh38(Datablock):
+    """
+        GRCh38: Genome Reference Consortium Human Build 38 Organism: Homo sapiens (human) Submitter: Genome Reference Consortium Date: 2013/12/17
+
+        Docs:
+            * GRCh38: https://gatk.broadinstitute.org/hc/en-us/articles/360035890951-Human-genome-reference-builds-GRCh38-or-hg38-b37-hg19
+            * GFF format: 
+                . https://learn.gencore.bio.nyu.edu/ngs-file-formats/gff3-format/
+                . https://github.com/The-Sequence-Ontology/Specifications/blob/master/gff3.md
+            * FNA format: FASTA nucleic acid
+                . https://en.wikipedia.org/wiki/FASTA_format
+        Tools:
+            * Genome browser: https://genome.ucsc.edu/cgi-bin/hgGateway
+    """
+    REVISION = "0.0.1"
+    TOPICS = {'sequences': "GRCh38_latest_genomic.sequences.parquet",
+              'annotations': "GRCh38_latest_genomic.annotations.parquet",
+              'attributes': None,
+    }
+    
+    GRCh38_URL = "https://ftp.ncbi.nlm.nih.gov/refseq/H_sapiens/annotation/GRCh38_latest/refseq_identifiers"
+    GRCh38_FILE_BASENAME = "GRCh38_latest_genomic"
+    EXTENSIONS = {'sequences': '.fna.gz',
+                  'annotations': '.gff.gz'
+    }
+
+    def valid(self, topic):
+        if topic == 'attributes':
+            topic = "annotations"
+        return super().valid(topic)
+
+    def build(self):
+        self.print_verbose(f"Building GRCh38")
+        if self.filesystem.protocol != 'file':
+            raise ValueError(f"Only local filesystem supported, instead got {self.filesystem}")
+        
+        for topic, ext in self.EXTENSIONS.items():
+            self.print_verbose(f"Downloading data for topic {repr(topic)}")
+            filename = self.GRCh38_FILE_BASENAME + ext
+            httpfs = fsspec.filesystem('http')
+            remote_fna = self.GRCh38_URL+'/'+f'{filename}'
+            local_fna = self.path(topic)
+            self.print_debug(f"Using files: {remote_fna} -> {local_fna}")
+            self.print_verbose(f"Downloading {remote_fna} to {local_fna}")
+            httpfs.get(remote_fna, local_fna, callback=TqdmCallback())
+            self.print_verbose(f"Done downloading data for topic {repr(topic)}")
+
+            with gzip.open(local_fna, 'r') as topicfile:
+                self.print_verbose(f"Parsing data for topic {repr(topic)}")
+                topicstr = topicfile.read().decode()
+                if topic == 'sequences':
+                    topicf = self._parse_sequences(topicstr)      
+                if topic == 'annotations':
+                    topicf = self._parse_annotations(topicstr)
+                self.print_verbose(f"Done parsing data for topic {repr(topic)}")
+                topicpath = self.path(topic)
+                topicf.to_parquet(topicpath, storage_options=self.filesystem.storage_options)
+                self.print_verbose(f"Stored frame with {len(topicf)} rows to {repr(topicpath)}")
+
+    def read(self, topic):
+        if topic != 'attributes':
+            self.print_verbose(f"Reading '{self.__class__.__qualname__}' topic {repr(topic)}")
+            topic_tgt_path = self.path(topic)
+            topic_frame = pd.read_parquet(topic_tgt_path, storage_options=self.filesystem.storage_options)
+        else:
+            anns = self.read('annotations')
+            topic_frame = pd.DataFrame({'attributes': [{key: val for key, val in [tuple(s.split('=')) for s in ann.attributes.split(";")]} for _, ann in anns.iterrows()]}, index=anns.index)
+        return topic_frame
+
+    @staticmethod
+    def _parse_sequences(seqstr):
+        lines = seqstr.split('\n')
+        f_ = pd.DataFrame({'raw': lines})
+        
+        f_['key'] = None
+        f_['is_key'] = f_.raw.str.startswith('>')
+        keymask = f_['is_key']
+        f_.loc[keymask, 'ID'] = f_[keymask]['raw'].apply(lambda s: s[1:].split(' ')[0])
+        f_['key'] = f_['is_key'].cumsum()
+        
+        keyf = f_[keymask].set_index('key') 
+        seqf = pd.DataFrame({'seq': f_.loc[~keymask].groupby('key').apply(lambda g: ''.join(g.raw))})
+        seqf['seqid'] = keyf['ID']
+        
+        seqf['seqlen'] = seqf.seq.str.len()
+        seqf['offset'] = seqf['seqlen'].cumsum().shift(1).fillna(0).astype(int)
+        return seqf
+    
+    @staticmethod
+    def _parse_annotations(gffstr):
+        gffstrs_ = gffstr.split('\n')
+        gffstrs = [s for s in gffstrs_ if not s.startswith('#')]
+        
+        gffio = StringIO('\n'.join(gffstrs))
+        gff = pd.read_csv(gffio, sep='\t', names=['seqid', 'source', 'type', 'start', 'end', 'score', 'strand', 'phase', 'attributes'])
+        attr = gff.attributes.str.strip()
+        gff['ID'] = attr.apply(lambda _: _[3:].split(';')[0].split(':')[0])
+        return gff
+    
+
+class GRCh38GeneSeqs(Datablock):
+    """
+        Evaluation set for expression count models, such as Enformer
+            * TODO: Enformer URL and literature
+        We extract sequences following the procedure outlined in 
+            * "Benchmarking of deep neural networks for predicting personal gene expression from DNA sequence highlights shortcomings", A. Sasse et al.
+            * 'Methods. Predicting gene expressions with Enformer'
+            * https://www.nature.com/articles/s41588-023-01524-6
+    """
+    REVISION = "0.0.1"
+    FILENAME = "sequences.parquet"
+
+    @dataclass
+    class SCOPE:
+        sequences: pd.DataFrame
+        annotations: pd.DataFrame
+        gene_ids: pd.DataFrame # row-vector of gene_ids (single row with columns indexing gene_ids)
+        gene_bucket_number: int = 0
+        gene_bucket_count: int = 100
+        lookback_bps: int = 192000
+        
+    def build(self):
+        assert (0 <= self.scope.gene_bucket_number) and \
+               (self.scope.gene_bucket_number < self.scope.gene_bucket_count)
+        N = len(self.scope.gene_ids)
+        bucket_size = (N+1)//self.scope.gene_bucket_count
+        lo = bucket_size*self.scope.bucket_number
+        hi = min(N, lo+bucket_size)
+        gene_ids = self.scope.gene_ids.iloc[lo:hi]
+        genes = [g.split('|')[1] for g in gene_ids]
+
+        path = self.path()
+
+
+    
+        
+
+            
+
